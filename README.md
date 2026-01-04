@@ -97,9 +97,7 @@ Add to your `mcpServers` config (adjust paths):
 - aflpp.preflight_checks: Run lightweight preflight checks before starting `afl-fuzz` (core_pattern, CPU scaling, corpus non-empty).
 - aflpp.start_fuzz: Start an `afl-fuzz` job in the workspace (non-blocking; supports common afl-fuzz knobs + allowlisted env overrides).
 - aflpp.start_fuzz_cluster: Start a multi-instance `afl-fuzz` campaign (master + secondary instances; supports per-instance overrides).
-- aflpp.start_fuzz_ci_cluster: Start a CI-oriented campaign (secondary-only instances; enables `AFL_FAST_CAL` + `AFL_CMPLOG_ONLY_NEW` by default).
 - aflpp.stop_fuzz: Stop a running `afl-fuzz` job by PID (SIGTERM then SIGKILL).
-- aflpp.stop_fuzz_cluster: Stop a running `afl-fuzz` campaign by stopping all recorded instance PIDs.
 - aflpp.status: Get job status by parsing `fuzzer_stats` and queue/crashes/hangs counts (with deltas since last call).
 - aflpp.campaign_summary: Summarize a multi-instance campaign by parsing `fuzzer_stats` for each instance directory.
 - aflpp.whatsup: Run `afl-whatsup` on an AFL++ output directory.
@@ -111,4 +109,3 @@ Add to your `mcpServers` config (adjust paths):
 - aflpp.minimize_corpus: Minimize a corpus using `afl-cmin` and store it as a new corpus directory in the workspace.
 - aflpp.minimize_testcase: Minimize a single testcase using `afl-tmin` and store the minimized testcase under `repros/`.
 - aflpp.suggest_fuzz_cluster_mix: Suggest a multi-core campaign mix (`instance_overrides`) for `aflpp.start_fuzz_cluster`.
-- aflpp.distributed_sync_plan: Generate an rsync mesh script for syncing distributed campaigns across multiple hosts.
