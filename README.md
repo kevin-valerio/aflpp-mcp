@@ -1,4 +1,4 @@
-# aflpp-mcp
+# AFL++ MCP server
 
 Production-oriented Model Context Protocol (MCP) server for AFL++ workflows (stdio transport, allowlisted tools).
 
@@ -11,7 +11,7 @@ This repo vendors an `AFLplusplus/` checkout/build and exposes a constrained, ag
 - polling structured status and triaging findings.
 
 ## Install
- 
+
 ### Build
 
 ```bash
@@ -26,7 +26,7 @@ Build first, then register the MCP server with Codex CLI:
 ```bash
 codex mcp add aflpp --env AFLPP_MCP_ROOT="$PWD" -- node "$PWD/dist/index.js"
 ```
- 
+
 
 ### Run (stdio MCP server)
 
@@ -61,7 +61,7 @@ Add to your `mcpServers` config (adjust paths):
   }
 }
 ```
- 
+
 ## How to use
 
 ### Quickstart workflow (recommended tool order)
