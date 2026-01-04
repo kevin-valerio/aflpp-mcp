@@ -1,0 +1,15 @@
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==179140==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x60d3d6c62727 bp 0x7ffee2232e00 sp 0x7ffee2232d40 T0)
+==179140==The signal is caused by a WRITE memory access.
+==179140==Hint: address points to the zero page.
+    #0 0x60d3d6c62727 in crashNow() /home/kevinv/aflpp-mcp/fixtures/cpp/src/main.cpp:44:6
+    #1 0x60d3d6c62727 in handleInput(std::vector<unsigned char, std::allocator<unsigned char>> const&) /home/kevinv/aflpp-mcp/fixtures/cpp/src/main.cpp:53:5
+    #2 0x60d3d6c62727 in main /home/kevinv/aflpp-mcp/fixtures/cpp/src/main.cpp:83:3
+    #3 0x7d609722a1c9  (/lib/x86_64-linux-gnu/libc.so.6+0x2a1c9) (BuildId: 274eec488d230825a136fa9c4d85370fed7a0a5e)
+    #4 0x7d609722a28a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x2a28a) (BuildId: 274eec488d230825a136fa9c4d85370fed7a0a5e)
+    #5 0x60d3d6b864e4 in _start (/home/kevinv/aflpp-mcp/workspaces/fixture_smoke/targets/fixture_cpp/asan/aflpp_mcp_fixture+0x2d4e4) (BuildId: 21dff4f9a0af9608f4c41076c35fc7166d77c17e)
+
+AddressSanitizer can not provide additional info.
+SUMMARY: AddressSanitizer: SEGV /home/kevinv/aflpp-mcp/fixtures/cpp/src/main.cpp:44:6 in crashNow()
+==179140==ABORTING

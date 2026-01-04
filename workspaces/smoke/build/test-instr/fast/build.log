@@ -1,0 +1,6 @@
+/home/kevinv/aflpp-mcp/AFLplusplus/afl-cc -o test-instr test-instr.c
+/home/kevinv/aflpp-mcp/AFLplusplus/afl-cc -o test-instr test-instr.c
+/home/kevinv/aflpp-mcp/AFLplusplus/afl-cc -o test-instr test-instr.c
+/home/kevinv/aflpp-mcp/AFLplusplus/afl-cc -o test-instr test-instr.c
+/home/kevinv/aflpp-mcp/AFLplusplus/afl-cc -o test-instr test-instr.c
+/home/kevinv/aflpp-mcp/AFLplusplus/afl-cc -o test-instr test-instr.c

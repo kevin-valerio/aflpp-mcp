@@ -1,0 +1,3 @@
+progress plotting utility for afl-fuzz by Michal Zalewski
+
+[-] Error: plot_data carries too little data, let it run longer.

@@ -1,0 +1,3 @@
+/home/kevinv/aflpp-mcp/fixtures/cpp/build/CMakeFiles/aflpp_mcp_fixture.dir
+/home/kevinv/aflpp-mcp/fixtures/cpp/build/CMakeFiles/edit_cache.dir
+/home/kevinv/aflpp-mcp/fixtures/cpp/build/CMakeFiles/rebuild_cache.dir
