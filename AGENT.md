@@ -1,19 +1,6 @@
 # aflpp-mcp file map
 
 This document maps the important files/directories in this repo to their purpose.
-When you add a feature or change behavior, update the relevant doc(s) here (e.g. `DESIGN.md`, `TOOL_SCHEMA.md`, `finished.md`, `to_finish.md`) so the repo stays consistent.
-
-## Top-level docs
-
-- `README.md`: install/run instructions, client config snippets, manual runbook, and smoke-test usage.
-- `DESIGN.md`: design rationale (tool list, safety model, resource limits, assumptions, data model).
-- `TOOL_SCHEMA.md`: tool-by-tool parameter/return shape reference (JSON I/O conventions).
-- `finished.md`: what is implemented so far (feature/tool checklist).
-- `to_finish.md`: backlog of remaining work and known limitations.
-
-## Cursor integration
-
-- `.cursor/rules/aflpp-mcp.rule`: guidance text for an LLM fuzzing agent (mirrors the server prompt).
 
 ## MCP server (TypeScript)
 
