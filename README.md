@@ -3,12 +3,12 @@
 Model Context Protocol (MCP) server for AFL++.
 
 This repo includes a`AFLplusplus/` checkout and exposes an agent-friendly API for:
-	- creating fuzzing workspaces,
-	- instrumenting targets,
-	- corpus import/minimization,
-	- harness preflight (dry run / showmap),
-	- starting/stopping AFL++ jobs,
-	- polling structured status and triaging findings.
+- creating fuzzing workspaces,
+- instrumenting targets,
+- corpus import/minimization,
+- harness preflight (dry run / showmap),
+- starting/stopping AFL++ jobs,
+- polling structured status and triaging findings.
 
 ## Install
 
