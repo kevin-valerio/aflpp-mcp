@@ -2,13 +2,14 @@
 
 Model Context Protocol (MCP) server for AFL++.
 
-This repo includes an `AFLplusplus/` checkout (git submodule; run `git submodule update --init` — add `--recursive` if you need AFL++ optional mode submodules) and exposes an agent-friendly API for:
+This repo includes an `AFLplusplus` checkout (`git submodule update --init` with `--recursive` if you need AFL++ optional mode submodules) and exposes an agent-friendly API for:
 - creating fuzzing workspaces,
 - instrumenting targets,
 - corpus import/minimization,
 - harness preflight (dry run / showmap),
 - starting/stopping AFL++ jobs,
-- polling structured status and triaging findings.
+- polling structured status and triaging findings,
+- other stuff
 
 ## Install
 
@@ -63,18 +64,18 @@ Add to your `mcpServers` config (adjust paths):
 ## MCP prompts
 
 - `aflpp-agent-workflow`: high-level end-to-end workflow (build -> corpus -> preflight -> fuzz -> triage).
-- `aflpp-harness-workplan`: harness-first workflow (usage -> LLVMFuzzerTestOneInput harness -> genesis corpus -> CMPLOG/ASAN/vanilla builds -> launch commands).
+- `aflpp-harness-workplan`: harness-first workflow (usage -> `LLVMFuzzerTestOneInput` harness -> genesis corpus -> CMPLOG/ASAN/vanilla builds -> launch commands).
 
 ## MCP resources
 
 - `aflpp://config`: server configuration (workspace root, limits, allowlist).
-- `aflpp://docs/quickstart`: curated agent workflow notes.
-- `aflpp://docs/fuzzing_in_depth`: upstream AFL++ `fuzzing_in_depth.md` (local checkout).
-- `aflpp://docs/cmplog`: upstream AFL++ `instrumentation/README.cmplog.md` (local checkout).
-- `aflpp://docs/env_variables`: upstream AFL++ `docs/env_variables.md` (local checkout).
-- `aflpp://workspace/{name}/tree`: high-level workspace tree (sanitized).
-- `aflpp://job/{job_name}/latest_status`: latest parsed status snapshot for a job (best-effort lookup).
-- `aflpp://campaign/{campaign_name}/latest_status`: latest parsed status snapshot for a campaign (best-effort lookup).
+- `aflpp://docs/quickstart`: some workflow notes.
+- `aflpp://docs/fuzzing_in_depth`:  AFL++'s `fuzzing_in_depth.md`
+- `aflpp://docs/cmplog`:  AFL++'s `instrumentation/README.cmplog.md`
+- `aflpp://docs/env_variables`: AFL++'s `docs/env_variables.md`
+- `aflpp://workspace/{name}/tree`: high-level workspace tree
+- `aflpp://job/{job_name}/latest_status`: latest parsed status snapshot for a job
+- `aflpp://campaign/{campaign_name}/latest_status`: latest parsed status snapshot for a campaign
 
 ## MCP tools
 
@@ -111,4 +112,3 @@ Add to your `mcpServers` config (adjust paths):
 - aflpp.minimize_testcase: Minimize a single testcase using `afl-tmin` and store the minimized testcase under `repros/`.
 - aflpp.suggest_fuzz_cluster_mix: Suggest a multi-core campaign mix (`instance_overrides`) for `aflpp.start_fuzz_cluster`.
 - aflpp.distributed_sync_plan: Generate an rsync mesh script for syncing distributed campaigns across multiple hosts.
- 
