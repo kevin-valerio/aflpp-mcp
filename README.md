@@ -37,9 +37,6 @@ node dist/index.js
 
 - `AFLPP_MCP_ROOT` (default: current working directory)
 - `AFLPP_DIR` (default: `$AFLPP_MCP_ROOT/AFLplusplus`) – must be inside `AFLPP_MCP_ROOT`
-- `AFLPP_MCP_MAX_TOOL_OUTPUT_BYTES` (default: `200000`)
-- `AFLPP_MCP_MAX_LOG_BYTES` (default: `5000000`)
-- `AFLPP_MCP_DEFAULT_TIMEOUT_MS` (default: `30000`)
 
 ### Other MCP client configs
 
@@ -66,11 +63,15 @@ Add to your `mcpServers` config (adjust paths):
 ## MCP prompts
 
 - `aflpp-agent-workflow`: high-level end-to-end workflow (build -> corpus -> preflight -> fuzz -> triage).
+- `aflpp-harness-workplan`: harness-first workflow (usage -> LLVMFuzzerTestOneInput harness -> genesis corpus -> CMPLOG/ASAN/vanilla builds -> launch commands).
 
 ## MCP resources
 
 - `aflpp://config`: server configuration (workspace root, limits, allowlist).
 - `aflpp://docs/quickstart`: curated agent workflow notes.
+- `aflpp://docs/fuzzing_in_depth`: upstream AFL++ `fuzzing_in_depth.md` (local checkout).
+- `aflpp://docs/cmplog`: upstream AFL++ `instrumentation/README.cmplog.md` (local checkout).
+- `aflpp://docs/env_variables`: upstream AFL++ `docs/env_variables.md` (local checkout).
 - `aflpp://workspace/{name}/tree`: high-level workspace tree (sanitized).
 - `aflpp://job/{job_name}/latest_status`: latest parsed status snapshot for a job (best-effort lookup).
 - `aflpp://campaign/{campaign_name}/latest_status`: latest parsed status snapshot for a campaign (best-effort lookup).

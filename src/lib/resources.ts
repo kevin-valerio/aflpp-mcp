@@ -6,7 +6,7 @@ import { Resource, ResourceTemplate } from "@modelcontextprotocol/sdk/types.js";
 import { getConfig } from "./config.js";
 import { ToolError } from "./errors.js";
 import { ensureDir, pathExists, workspacePath } from "./fs.js";
-import { validateName } from "./validate.js";
+import { assertWithinRoot, validateName } from "./validate.js";
 
 type ReadResult = { mimeType: string; text: string };
 
@@ -44,6 +44,24 @@ export function listResources(): Resource[] {
       uri: "aflpp://docs/quickstart",
       name: "AFL++ MCP quickstart",
       description: "Curated workflow notes for the fuzzing agent.",
+      mimeType: "text/markdown",
+    },
+    {
+      uri: "aflpp://docs/fuzzing_in_depth",
+      name: "AFL++ docs: fuzzing_in_depth",
+      description: "Upstream AFL++ documentation: fuzzing_in_depth.md (local checkout).",
+      mimeType: "text/markdown",
+    },
+    {
+      uri: "aflpp://docs/cmplog",
+      name: "AFL++ docs: CmpLog",
+      description: "Upstream AFL++ documentation: instrumentation/README.cmplog.md (local checkout).",
+      mimeType: "text/markdown",
+    },
+    {
+      uri: "aflpp://docs/env_variables",
+      name: "AFL++ docs: env_variables",
+      description: "Upstream AFL++ documentation: docs/env_variables.md (local checkout).",
       mimeType: "text/markdown",
     },
   ];
@@ -118,6 +136,24 @@ export async function readResource(uri: string): Promise<ReadResult> {
       "- No arbitrary shell execution; only AFL++ tools + constrained build commands.",
       "",
     ].join("\n");
+    return { mimeType: "text/markdown", text };
+  }
+
+  if (uri === "aflpp://docs/fuzzing_in_depth") {
+    const p = assertWithinRoot(cfg.workspaceRoot, path.join(cfg.aflppDir, "docs", "fuzzing_in_depth.md"), "AFL++ docs path");
+    const text = await fs.readFile(p, "utf8");
+    return { mimeType: "text/markdown", text };
+  }
+
+  if (uri === "aflpp://docs/cmplog") {
+    const p = assertWithinRoot(cfg.workspaceRoot, path.join(cfg.aflppDir, "instrumentation", "README.cmplog.md"), "AFL++ docs path");
+    const text = await fs.readFile(p, "utf8");
+    return { mimeType: "text/markdown", text };
+  }
+
+  if (uri === "aflpp://docs/env_variables") {
+    const p = assertWithinRoot(cfg.workspaceRoot, path.join(cfg.aflppDir, "docs", "env_variables.md"), "AFL++ docs path");
+    const text = await fs.readFile(p, "utf8");
     return { mimeType: "text/markdown", text };
   }
 
