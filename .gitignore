@@ -1,5 +1,7 @@
+.idea/
 node_modules/
 dist/
+workspaces/
 
 fixtures/cpp/**
 !fixtures/cpp/CMakeLists.txt
