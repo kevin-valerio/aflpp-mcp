@@ -10,6 +10,7 @@ export type AflBinaryName =
   | "afl-showmap"
   | "afl-cmin"
   | "afl-tmin"
+  | "afl-analyze"
   | "afl-whatsup"
   | "afl-plot"
   | "afl-cc"
@@ -49,4 +50,16 @@ export function validateTargetCmdExecutable(root: string, targetCmd: string[]): 
     );
   }
   assertWithinRoot(root, path.resolve(root, exe), "target_cmd[0]");
+}
+
+export function parseFuzzerStats(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (key) out[key] = value;
+  }
+  return out;
 }

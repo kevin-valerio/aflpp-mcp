@@ -21,10 +21,25 @@
 - `aflpp.start_fuzz` enhancements:
   - writes a capped `afl-fuzz` stdout/stderr job log to `workspaces/<ws>/reports/jobs/<job_name>.log`,
   - supports bounded fuzzing runs via `fuzz_seconds` (`afl-fuzz -V`).
+- Build tooling knobs:
+  - `build_instrumented` / `build_cmplog_variant` accept `build_options` for common AFL++ compile-time env flags (laf-intel, allow/denylist, ctx/ngram coverage, dict2file, extra sanitizers, forkserver-only).
+  - `profile="lto"` builds set `AR`/`RANLIB` to `llvm-ar` / `llvm-ranlib` when available.
 - Campaign management (multi-instance):
   - `aflpp.start_fuzz_cluster` / `aflpp.stop_fuzz_cluster` with per-instance PID tracking and on-disk metadata under `workspaces/<ws>/reports/campaigns/<campaign_name>.json`,
   - `aflpp.campaign_summary` (parses per-instance `fuzzer_stats`),
   - `aflpp.generate_progress_plot` (wraps `afl-plot`).
+- Fuzz runtime knobs:
+  - `aflpp.start_fuzz` / `aflpp.start_fuzz_cluster` support common AFL++ flags (`-p/-P/-L/-a/-Z/-D/-f/-l/-C/-w/-F`) and allowlisted per-job env overrides (e.g. `AFL_TESTCACHE_SIZE`, `AFL_TMPDIR`, `AFL_FAST_CAL`, `AFL_EXPAND_HAVOC_NOW`, ...).
+  - `aflpp.start_fuzz_cluster` supports custom instance naming and per-instance overrides (including `target_cmd`).
+- Coverage & triage helpers:
+  - `aflpp.whatsup` (wraps `afl-whatsup`),
+  - `aflpp.coverage_summary` (wraps `afl-showmap -C`),
+  - `aflpp.analyze_testcase` (wraps `afl-analyze`),
+  - `aflpp.casr_report` (wraps `casr-afl` if installed).
+- CI / distributed helpers:
+  - `aflpp.start_fuzz_ci_cluster` (secondary-only CI runs; enables `AFL_FAST_CAL` + `AFL_CMPLOG_ONLY_NEW` by default),
+  - `aflpp.suggest_fuzz_cluster_mix` (recommended per-instance mix),
+  - `aflpp.distributed_sync_plan` (rsync mesh script generator).
 - Triage/reporting:
   - `aflpp.crash_report` (writes a report + sanitizer frame extraction + deterministic dedup signature).
 - Preflight helper:
@@ -48,19 +63,26 @@ Corpus & dictionary:
 Preflight:
 - `aflpp.dry_run`
 - `aflpp.showmap` (wraps `afl-showmap`)
+- `aflpp.coverage_summary` (wraps `afl-showmap -C`)
 - `aflpp.preflight_checks`
 
 Fuzz lifecycle (single job):
 - `aflpp.start_fuzz`, `aflpp.stop_fuzz`
 - `aflpp.status` (parses `fuzzer_stats` + counts; returns count deltas)
 - `aflpp.list_findings`, `aflpp.repro_crash`, `aflpp.crash_report`
+- `aflpp.analyze_testcase`
 
 Campaign management (multi-instance):
 - `aflpp.start_fuzz_cluster`, `aflpp.stop_fuzz_cluster`
+- `aflpp.start_fuzz_ci_cluster`
 - `aflpp.campaign_summary`, `aflpp.generate_progress_plot`
+- `aflpp.whatsup`
+- `aflpp.suggest_fuzz_cluster_mix`
+- `aflpp.distributed_sync_plan`
 
 Minimization:
 - `aflpp.minimize_testcase` (wraps `afl-tmin`)
+- `aflpp.casr_report` (optional; wraps `casr-afl` if installed)
 
 ## Prompts / resources
 

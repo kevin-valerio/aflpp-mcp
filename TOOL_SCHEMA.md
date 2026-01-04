@@ -26,6 +26,7 @@ Input:
 - `project_path: string`
 - `build_cmd: string[]` (allowlisted `build_cmd[0]`)
 - `profile: "fast"|"asan"|"msan"|"ubsan"|"lto"`
+- `build_options?: { llvm_laf_all?, llvm_allowlist_path?, llvm_denylist_path?, coverage_mode?, ngram_size?, llvm_dict2file_path?, llvm_dict2file_no_main?, llvm_only_forkserver?, sanitizers? }`
 - `artifact_relpath: string`
 - `timeout_ms?: number`
 
@@ -33,11 +34,11 @@ Output:
 - `build` (exit/timeout + capped stdout/stderr)
 - `build_log_path` (capped file)
 - `artifact: { id, source_path, stored_path }`
-- `env_used` (compiler wrapper + sanitizer env)
+- `env_used` (compiler wrapper + relevant AFL_* env)
 
 ### `aflpp.build_cmplog_variant`
 
-Same shape as `build_instrumented`, but uses `AFL_LLVM_CMPLOG=1` and stores under `targets/<target_name>/cmplog/`.
+Same shape as `build_instrumented` (including `build_options?`), but uses `AFL_LLVM_CMPLOG=1` and stores under `targets/<target_name>/cmplog/`.
 
 ### `aflpp.import_corpus`
 
@@ -87,6 +88,17 @@ Input:
 - `fuzz_seconds?: number` (maps to `afl-fuzz -V`)
 - `dictionary_paths?: string[]` (maps to up to 4x `afl-fuzz -x`)
 - `cmplog_path?: string` (maps to `afl-fuzz -c`)
+- `cmplog_level?: string` (maps to `afl-fuzz -l`)
+- `power_schedule?: string` (maps to `afl-fuzz -p`)
+- `mode_preset?: "explore"|"exploit"` (maps to `afl-fuzz -P`)
+- `mopt_level?: number` (maps to `afl-fuzz -L`)
+- `ascii_mode?: "ascii"|"binary"` (maps to `afl-fuzz -a`)
+- `old_queue_cycle?: boolean` (maps to `afl-fuzz -Z`)
+- `deterministic_only?: boolean` (maps to `afl-fuzz -D`)
+- `input_file_path?: string` (maps to `afl-fuzz -f`)
+- `crash_exploration?: boolean` (maps to `afl-fuzz -C`)
+- `sanitizer_paths?: string[]` (maps to repeated `afl-fuzz -w` for SAND)
+- `env?: { AFL_TESTCACHE_SIZE?, AFL_TMPDIR?, AFL_IMPORT_FIRST?, AFL_IGNORE_SEED_PROBLEMS?, AFL_FAST_CAL?, AFL_CMPLOG_ONLY_NEW?, AFL_NO_STARTUP_CALIBRATION?, AFL_DISABLE_TRIM?, AFL_KEEP_TIMEOUTS?, AFL_EXPAND_HAVOC_NOW?, AFL_NO_AFFINITY?, AFL_TRY_AFFINITY?, AFL_FINAL_SYNC?, AFL_AUTORESUME? }`
 - `resume?: boolean`
 
 Output:
@@ -96,6 +108,7 @@ Output:
 - `job_meta_path`
 - `job_log_path`
 - `out_dir` (AFL++ output dir)
+- `fuzz_options` (selected runtime knobs + applied `env_overrides`)
 
 ### `aflpp.start_fuzz_cluster`
 
@@ -105,7 +118,10 @@ Input:
 - `instances: number` (master + secondaries)
 - `target_cmd: string[]`
 - `corpus_name: string`
-- `options?: { timeout_ms?, mem_limit_mb?, seed?, fuzz_seconds?, dictionary_paths?, cmplog_path?, resume? }`
+- `master_instance_name?: string` (default: `master`)
+- `secondary_instance_prefix?: string` (default: `slave`)
+- `options?: { timeout_ms?, mem_limit_mb?, seed?, fuzz_seconds?, dictionary_paths?, cmplog_path?, cmplog_level?, foreign_sync_dirs?, power_schedule?, mode_preset?, mopt_level?, ascii_mode?, old_queue_cycle?, deterministic_only?, input_file_path?, crash_exploration?, sanitizer_paths?, env?, resume? }`
+- `instance_overrides?: Record<instance_name, { target_cmd?, timeout_ms?, mem_limit_mb?, seed?, fuzz_seconds?, dictionary_paths?, cmplog_path?, cmplog_level?, power_schedule?, mode_preset?, mopt_level?, ascii_mode?, old_queue_cycle?, deterministic_only?, input_file_path?, crash_exploration?, sanitizer_paths?, env? }>`
 
 Output:
 - `campaign_id`
@@ -113,6 +129,34 @@ Output:
 - `instances[]` (per-instance pid/argv/log paths)
 - `campaign_meta_path`
 - `campaign_files_dir`
+
+### `aflpp.start_fuzz_ci_cluster`
+
+Starts a CI-oriented campaign (secondary-only instances). Enables `AFL_FAST_CAL` and `AFL_CMPLOG_ONLY_NEW` by default.
+
+### `aflpp.whatsup`
+
+Wraps `afl-whatsup` for an `out_dir` (or `job_name` / `campaign_name`).
+
+### `aflpp.coverage_summary`
+
+Wraps `afl-showmap -C` for an `out_dir` (or `job_name` / `campaign_name`) and parses the edge/tuple summary (best-effort).
+
+### `aflpp.analyze_testcase`
+
+Wraps `afl-analyze` for a single testcase.
+
+### `aflpp.casr_report`
+
+Wraps `casr-afl` (if installed) to generate clustered crash reports for an `out_dir` (or `job_name` / `campaign_name`).
+
+### `aflpp.suggest_fuzz_cluster_mix`
+
+Returns a recommended `instance_overrides` mix to pass into `aflpp.start_fuzz_cluster`.
+
+### `aflpp.distributed_sync_plan`
+
+Generates an rsync mesh script for syncing distributed campaigns across multiple hosts.
 
 ### `aflpp.stop_fuzz_cluster`
 

@@ -11,6 +11,9 @@ Located in `AFLplusplus/`:
 - `afl-showmap` – single-run trace collection / coverage sanity checks
 - `afl-cmin` – corpus minimization by coverage
 - `afl-tmin` – testcase minimization by execution behavior
+- `afl-analyze` – input sensitivity analysis helper
+- `afl-whatsup` – campaign status helper
+- `afl-plot` – HTML progress plots
 - `afl-cc`, `afl-c++` – compiler wrappers for instrumentation
 - `afl-clang-fast`, `afl-clang-fast++` – LLVM “classic” wrappers
 - `afl-clang-lto`, `afl-clang-lto++` – LTO mode wrappers
@@ -76,15 +79,22 @@ The server is designed so an agent can iteratively:
 - `aflpp.list_findings`
 - `aflpp.repro_crash` (runs target directly; writes a repro bundle)
 - `aflpp.crash_report` (writes a report + dedup signature)
+- `aflpp.analyze_testcase` (wraps `afl-analyze`)
 
 ### F) Campaign management (multi-instance)
 - `aflpp.start_fuzz_cluster`
+- `aflpp.start_fuzz_ci_cluster` (secondary-only CI runs)
 - `aflpp.stop_fuzz_cluster`
 - `aflpp.campaign_summary` (parses multiple `fuzzer_stats`)
+- `aflpp.whatsup` (wraps `afl-whatsup`)
+- `aflpp.coverage_summary` (wraps `afl-showmap -C`)
 - `aflpp.generate_progress_plot` (wraps `afl-plot`)
+- `aflpp.suggest_fuzz_cluster_mix` (recommended per-instance mix)
+- `aflpp.distributed_sync_plan` (rsync mesh script generator)
 
 ### G) Minimization helpers
 - `aflpp.minimize_testcase` (wraps `afl-tmin`)
+- `aflpp.casr_report` (optional; wraps `casr-afl` if installed)
 
 ## 4) Resources (read-only)
 
@@ -116,6 +126,7 @@ The server is designed so an agent can iteratively:
   - `start_fuzz` captures `afl-fuzz` stdout/stderr into a capped job log under `workspaces/<ws>/reports/jobs/<job_name>.log`.
   - `start_fuzz` supports bounded runs via `afl-fuzz -V` (`fuzz_seconds`).
   - `start_fuzz_cluster` captures per-instance `afl-fuzz` stdout/stderr logs under `workspaces/<ws>/reports/campaigns/<campaign_name>.d/`.
+  - `start_fuzz` / `start_fuzz_cluster` allow additional AFL++ runtime knobs (e.g. `-p/-P/-L/-a/-Z/-D/-f/-l/-C/-w/-F`) and an allowlisted set of per-job env overrides (e.g. `AFL_TESTCACHE_SIZE`, `AFL_TMPDIR`, `AFL_EXPAND_HAVOC_NOW`, ...).
   - The server sets `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1` for `afl-fuzz` by default to avoid aborting on systems where `core_pattern` is piped to an external handler.
 
 ### Structured logging

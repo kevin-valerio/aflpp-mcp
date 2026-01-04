@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -8,7 +9,7 @@ import { getConfig } from "./config.js";
 import { ToolError } from "./errors.js";
 import { copyDirRecursive, ensureDir, pathExists, safeCopyFile, workspacePath } from "./fs.js";
 import { writeToolLog } from "./logging.js";
-import { aflBin, getAflppReleaseVersion, validateTargetCmdExecutable } from "./aflpp.js";
+import { aflBin, getAflppReleaseVersion, parseFuzzerStats, validateTargetCmdExecutable } from "./aflpp.js";
 import { runCommand, spawnDetached } from "./subprocess.js";
 import {
   requireObject,
@@ -92,16 +93,82 @@ function stableIdFromPath(relativePath: string): string {
   return crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 16);
 }
 
-function parseFuzzerStats(text: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const line of text.split("\n")) {
-    const idx = line.indexOf(":");
-    if (idx === -1) continue;
-    const key = line.slice(0, idx).trim();
-    const value = line.slice(idx + 1).trim();
-    if (key) out[key] = value;
+async function resolveExecutableInPath(name: string): Promise<string | null> {
+  const envPath = process.env.PATH ?? "";
+  const dirs = envPath.split(path.delimiter).filter((d) => d.length > 0);
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name);
+    try {
+      await fs.access(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // ignore
+    }
   }
-  return out;
+  return null;
+}
+
+function requireOptionalStringNumberOrBoolean(value: unknown, name: string): string | number | boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  throw new ToolError("INVALID_ARGUMENT", `${name} must be a string, number, or boolean`);
+}
+
+function applyAflFuzzEnvOverrides(
+  root: string,
+  env: NodeJS.ProcessEnv,
+  raw: Record<string, unknown>,
+  name: string,
+): Record<string, string> {
+  const applied: Record<string, string> = {};
+
+  const allow: Record<string, { kind: "bool" | "num" | "path" }> = {
+    AFL_TESTCACHE_SIZE: { kind: "num" },
+    AFL_TMPDIR: { kind: "path" },
+    AFL_IMPORT_FIRST: { kind: "bool" },
+    AFL_IGNORE_SEED_PROBLEMS: { kind: "bool" },
+    AFL_FAST_CAL: { kind: "bool" },
+    AFL_CMPLOG_ONLY_NEW: { kind: "bool" },
+    AFL_NO_STARTUP_CALIBRATION: { kind: "bool" },
+    AFL_DISABLE_TRIM: { kind: "bool" },
+    AFL_KEEP_TIMEOUTS: { kind: "bool" },
+    AFL_EXPAND_HAVOC_NOW: { kind: "bool" },
+    AFL_NO_AFFINITY: { kind: "bool" },
+    AFL_TRY_AFFINITY: { kind: "bool" },
+    AFL_FINAL_SYNC: { kind: "bool" },
+    AFL_AUTORESUME: { kind: "bool" },
+  };
+
+  for (const [k, spec] of Object.entries(allow)) {
+    const v = requireOptionalStringNumberOrBoolean(raw[k], `${name}.${k}`);
+    if (v === undefined) continue;
+
+    if (spec.kind === "path") {
+      if (typeof v !== "string") throw new ToolError("INVALID_ARGUMENT", `${name}.${k} must be a string path`);
+      const abs = path.resolve(root, v);
+      if (path.relative(root, abs).startsWith("..")) throw new ToolError("PATH_OUTSIDE_ROOT", `${name}.${k} must be within workspace root`);
+      env[k] = abs;
+      applied[k] = abs;
+      continue;
+    }
+
+    if (typeof v === "boolean") {
+      if (v) {
+        env[k] = "1";
+        applied[k] = "1";
+      }
+      continue;
+    }
+
+    if (spec.kind === "num") {
+      if (typeof v !== "number" && typeof v !== "string") throw new ToolError("INVALID_ARGUMENT", `${name}.${k} must be a number or string`);
+    }
+
+    env[k] = String(v);
+    applied[k] = String(v);
+  }
+
+  return applied;
 }
 
 async function findInstanceDir(jobOutDir: string): Promise<string | null> {
@@ -282,6 +349,21 @@ registerTool({
       project_path: { type: "string" },
       build_cmd: { type: "array", items: { type: "string" } },
       profile: { type: "string", enum: ["fast", "asan", "msan", "ubsan", "lto"] },
+      build_options: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          llvm_laf_all: { type: "boolean" },
+          llvm_allowlist_path: { type: "string" },
+          llvm_denylist_path: { type: "string" },
+          coverage_mode: { type: "string", enum: ["default", "ctx", "caller", "ngram"] },
+          ngram_size: { type: "number" },
+          llvm_dict2file_path: { type: "string" },
+          llvm_dict2file_no_main: { type: "boolean" },
+          llvm_only_forkserver: { type: "boolean" },
+          sanitizers: { type: "array", items: { type: "string", enum: ["asan", "msan", "ubsan", "tsan", "lsan", "cfisan"] } },
+        },
+      },
       artifact_relpath: { type: "string" },
       timeout_ms: { type: "number" },
     },
@@ -302,6 +384,26 @@ registerTool({
     const artifactRelpath = requireString(args.artifact_relpath, "artifact_relpath");
     const timeoutMs = requireOptionalNumber(args.timeout_ms, "timeout_ms") ?? 10 * 60_000;
 
+    const buildOptions = args.build_options ? requireObject(args.build_options, "build_options") : {};
+    const llvmLafAll = requireOptionalBoolean(buildOptions.llvm_laf_all, "build_options.llvm_laf_all") ?? false;
+    const llvmAllowlistRaw = requireOptionalString(buildOptions.llvm_allowlist_path, "build_options.llvm_allowlist_path");
+    const llvmDenylistRaw = requireOptionalString(buildOptions.llvm_denylist_path, "build_options.llvm_denylist_path");
+    const coverageMode = requireOptionalString(buildOptions.coverage_mode, "build_options.coverage_mode") ?? "default";
+    const ngramSize = requireOptionalNumber(buildOptions.ngram_size, "build_options.ngram_size");
+    const dict2fileRaw = requireOptionalString(buildOptions.llvm_dict2file_path, "build_options.llvm_dict2file_path");
+    const dict2fileNoMain = requireOptionalBoolean(buildOptions.llvm_dict2file_no_main, "build_options.llvm_dict2file_no_main") ?? false;
+    const llvmOnlyForkserver = requireOptionalBoolean(buildOptions.llvm_only_forkserver, "build_options.llvm_only_forkserver") ?? false;
+    const sanitizerListRaw = buildOptions.sanitizers ? requireStringArray(buildOptions.sanitizers, "build_options.sanitizers") : [];
+
+    if (coverageMode === "ngram") {
+      if (ngramSize === undefined) throw new ToolError("INVALID_ARGUMENT", "build_options.ngram_size is required when coverage_mode='ngram'");
+      if (!Number.isFinite(ngramSize) || !Number.isInteger(ngramSize) || ngramSize < 2 || ngramSize > 16) {
+        throw new ToolError("INVALID_ARGUMENT", "build_options.ngram_size must be an integer between 2 and 16");
+      }
+    } else if (ngramSize !== undefined) {
+      throw new ToolError("INVALID_ARGUMENT", "build_options.ngram_size is only valid when coverage_mode='ngram'");
+    }
+
     const allowedBuild = new Set(["make", "cmake", "ninja", "meson", "cargo", "./configure"]);
     const cmd0 = buildCmd[0];
     if (!allowedBuild.has(cmd0)) {
@@ -319,14 +421,67 @@ registerTool({
     if (profile === "lto") {
       env.CC = aflBin("afl-clang-lto");
       env.CXX = aflBin("afl-clang-lto++");
+      if (!env.AR) {
+        const llvmAr = await resolveExecutableInPath("llvm-ar");
+        if (llvmAr) env.AR = llvmAr;
+      }
+      if (!env.RANLIB) {
+        const llvmRanlib = await resolveExecutableInPath("llvm-ranlib");
+        if (llvmRanlib) env.RANLIB = llvmRanlib;
+      }
     } else {
       env.CC = aflBin("afl-cc");
       env.CXX = aflBin("afl-c++");
     }
 
-    if (profile === "asan") env.AFL_USE_ASAN = "1";
-    if (profile === "msan") env.AFL_USE_MSAN = "1";
-    if (profile === "ubsan") env.AFL_USE_UBSAN = "1";
+    const sanitizers = new Set<string>(sanitizerListRaw);
+    if (profile === "asan") sanitizers.add("asan");
+    if (profile === "msan") sanitizers.add("msan");
+    if (profile === "ubsan") sanitizers.add("ubsan");
+    for (const s of sanitizers) {
+      if (!["asan", "msan", "ubsan", "tsan", "lsan", "cfisan"].includes(s)) {
+        throw new ToolError("INVALID_ARGUMENT", `Unsupported sanitizer '${s}'`);
+      }
+    }
+    if (sanitizers.has("asan")) env.AFL_USE_ASAN = "1";
+    if (sanitizers.has("msan")) env.AFL_USE_MSAN = "1";
+    if (sanitizers.has("ubsan")) env.AFL_USE_UBSAN = "1";
+    if (sanitizers.has("tsan")) env.AFL_USE_TSAN = "1";
+    if (sanitizers.has("lsan")) env.AFL_USE_LSAN = "1";
+    if (sanitizers.has("cfisan")) env.AFL_USE_CFISAN = "1";
+
+    if (llvmLafAll) env.AFL_LLVM_LAF_ALL = "1";
+    if (llvmOnlyForkserver) env.AFL_LLVM_ONLY_FSRV = "1";
+
+    const llvmAllowlistPath = llvmAllowlistRaw ? path.resolve(cfg.workspaceRoot, llvmAllowlistRaw) : undefined;
+    if (llvmAllowlistPath) {
+      if (path.relative(cfg.workspaceRoot, llvmAllowlistPath).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", "build_options.llvm_allowlist_path must be within workspace root");
+      }
+      env.AFL_LLVM_ALLOWLIST = llvmAllowlistPath;
+    }
+    const llvmDenylistPath = llvmDenylistRaw ? path.resolve(cfg.workspaceRoot, llvmDenylistRaw) : undefined;
+    if (llvmDenylistPath) {
+      if (path.relative(cfg.workspaceRoot, llvmDenylistPath).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", "build_options.llvm_denylist_path must be within workspace root");
+      }
+      env.AFL_LLVM_DENYLIST = llvmDenylistPath;
+    }
+
+    if (coverageMode === "ctx") env.AFL_LLVM_INSTRUMENT = "CTX";
+    if (coverageMode === "caller") env.AFL_LLVM_INSTRUMENT = "CALLER";
+    if (coverageMode === "ngram") env.AFL_LLVM_INSTRUMENT = `NGRAM-${String(ngramSize)}`;
+
+    const dict2filePath = dict2fileRaw ? path.resolve(cfg.workspaceRoot, dict2fileRaw) : undefined;
+    if (dict2filePath) {
+      if (path.relative(cfg.workspaceRoot, dict2filePath).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", "build_options.llvm_dict2file_path must be within workspace root");
+      }
+      env.AFL_LLVM_DICT2FILE = dict2filePath;
+      if (dict2fileNoMain) env.AFL_LLVM_DICT2FILE_NO_MAIN = "1";
+    } else if (dict2fileNoMain) {
+      throw new ToolError("INVALID_ARGUMENT", "build_options.llvm_dict2file_no_main requires build_options.llvm_dict2file_path");
+    }
 
     const run = await runCommand(buildCmd, {
       cwd: projectPath,
@@ -359,9 +514,21 @@ registerTool({
         AFL_PATH: env.AFL_PATH,
         CC: env.CC,
         CXX: env.CXX,
+        AR: env.AR,
+        RANLIB: env.RANLIB,
         AFL_USE_ASAN: env.AFL_USE_ASAN,
         AFL_USE_MSAN: env.AFL_USE_MSAN,
         AFL_USE_UBSAN: env.AFL_USE_UBSAN,
+        AFL_USE_TSAN: env.AFL_USE_TSAN,
+        AFL_USE_LSAN: env.AFL_USE_LSAN,
+        AFL_USE_CFISAN: env.AFL_USE_CFISAN,
+        AFL_LLVM_LAF_ALL: env.AFL_LLVM_LAF_ALL,
+        AFL_LLVM_ONLY_FSRV: env.AFL_LLVM_ONLY_FSRV,
+        AFL_LLVM_ALLOWLIST: env.AFL_LLVM_ALLOWLIST,
+        AFL_LLVM_DENYLIST: env.AFL_LLVM_DENYLIST,
+        AFL_LLVM_INSTRUMENT: env.AFL_LLVM_INSTRUMENT,
+        AFL_LLVM_DICT2FILE: env.AFL_LLVM_DICT2FILE,
+        AFL_LLVM_DICT2FILE_NO_MAIN: env.AFL_LLVM_DICT2FILE_NO_MAIN,
       },
       build: run,
       build_log_path: path.relative(cfg.workspaceRoot, buildLogPath).replaceAll("\\", "/"),
@@ -384,6 +551,21 @@ registerTool({
       target_name: { type: "string" },
       project_path: { type: "string" },
       build_cmd: { type: "array", items: { type: "string" } },
+      build_options: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          llvm_laf_all: { type: "boolean" },
+          llvm_allowlist_path: { type: "string" },
+          llvm_denylist_path: { type: "string" },
+          coverage_mode: { type: "string", enum: ["default", "ctx", "caller", "ngram"] },
+          ngram_size: { type: "number" },
+          llvm_dict2file_path: { type: "string" },
+          llvm_dict2file_no_main: { type: "boolean" },
+          llvm_only_forkserver: { type: "boolean" },
+          sanitizers: { type: "array", items: { type: "string", enum: ["asan", "msan", "ubsan", "tsan", "lsan", "cfisan"] } },
+        },
+      },
       artifact_relpath: { type: "string" },
       timeout_ms: { type: "number" },
     },
@@ -403,6 +585,26 @@ registerTool({
     const artifactRelpath = requireString(args.artifact_relpath, "artifact_relpath");
     const timeoutMs = requireOptionalNumber(args.timeout_ms, "timeout_ms") ?? 10 * 60_000;
 
+    const buildOptions = args.build_options ? requireObject(args.build_options, "build_options") : {};
+    const llvmLafAll = requireOptionalBoolean(buildOptions.llvm_laf_all, "build_options.llvm_laf_all") ?? false;
+    const llvmAllowlistRaw = requireOptionalString(buildOptions.llvm_allowlist_path, "build_options.llvm_allowlist_path");
+    const llvmDenylistRaw = requireOptionalString(buildOptions.llvm_denylist_path, "build_options.llvm_denylist_path");
+    const coverageMode = requireOptionalString(buildOptions.coverage_mode, "build_options.coverage_mode") ?? "default";
+    const ngramSize = requireOptionalNumber(buildOptions.ngram_size, "build_options.ngram_size");
+    const dict2fileRaw = requireOptionalString(buildOptions.llvm_dict2file_path, "build_options.llvm_dict2file_path");
+    const dict2fileNoMain = requireOptionalBoolean(buildOptions.llvm_dict2file_no_main, "build_options.llvm_dict2file_no_main") ?? false;
+    const llvmOnlyForkserver = requireOptionalBoolean(buildOptions.llvm_only_forkserver, "build_options.llvm_only_forkserver") ?? false;
+    const sanitizerListRaw = buildOptions.sanitizers ? requireStringArray(buildOptions.sanitizers, "build_options.sanitizers") : [];
+
+    if (coverageMode === "ngram") {
+      if (ngramSize === undefined) throw new ToolError("INVALID_ARGUMENT", "build_options.ngram_size is required when coverage_mode='ngram'");
+      if (!Number.isFinite(ngramSize) || !Number.isInteger(ngramSize) || ngramSize < 2 || ngramSize > 16) {
+        throw new ToolError("INVALID_ARGUMENT", "build_options.ngram_size must be an integer between 2 and 16");
+      }
+    } else if (ngramSize !== undefined) {
+      throw new ToolError("INVALID_ARGUMENT", "build_options.ngram_size is only valid when coverage_mode='ngram'");
+    }
+
     const allowedBuild = new Set(["make", "cmake", "ninja", "meson", "cargo", "./configure"]);
     const cmd0 = buildCmd[0];
     if (!allowedBuild.has(cmd0)) {
@@ -419,6 +621,52 @@ registerTool({
     env.AFL_LLVM_CMPLOG = "1";
     env.CC = aflBin("afl-clang-fast");
     env.CXX = aflBin("afl-clang-fast++");
+
+    const sanitizers = new Set<string>(sanitizerListRaw);
+    for (const s of sanitizers) {
+      if (!["asan", "msan", "ubsan", "tsan", "lsan", "cfisan"].includes(s)) {
+        throw new ToolError("INVALID_ARGUMENT", `Unsupported sanitizer '${s}'`);
+      }
+    }
+    if (sanitizers.has("asan")) env.AFL_USE_ASAN = "1";
+    if (sanitizers.has("msan")) env.AFL_USE_MSAN = "1";
+    if (sanitizers.has("ubsan")) env.AFL_USE_UBSAN = "1";
+    if (sanitizers.has("tsan")) env.AFL_USE_TSAN = "1";
+    if (sanitizers.has("lsan")) env.AFL_USE_LSAN = "1";
+    if (sanitizers.has("cfisan")) env.AFL_USE_CFISAN = "1";
+
+    if (llvmLafAll) env.AFL_LLVM_LAF_ALL = "1";
+    if (llvmOnlyForkserver) env.AFL_LLVM_ONLY_FSRV = "1";
+
+    const llvmAllowlistPath = llvmAllowlistRaw ? path.resolve(cfg.workspaceRoot, llvmAllowlistRaw) : undefined;
+    if (llvmAllowlistPath) {
+      if (path.relative(cfg.workspaceRoot, llvmAllowlistPath).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", "build_options.llvm_allowlist_path must be within workspace root");
+      }
+      env.AFL_LLVM_ALLOWLIST = llvmAllowlistPath;
+    }
+    const llvmDenylistPath = llvmDenylistRaw ? path.resolve(cfg.workspaceRoot, llvmDenylistRaw) : undefined;
+    if (llvmDenylistPath) {
+      if (path.relative(cfg.workspaceRoot, llvmDenylistPath).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", "build_options.llvm_denylist_path must be within workspace root");
+      }
+      env.AFL_LLVM_DENYLIST = llvmDenylistPath;
+    }
+
+    if (coverageMode === "ctx") env.AFL_LLVM_INSTRUMENT = "CTX";
+    if (coverageMode === "caller") env.AFL_LLVM_INSTRUMENT = "CALLER";
+    if (coverageMode === "ngram") env.AFL_LLVM_INSTRUMENT = `NGRAM-${String(ngramSize)}`;
+
+    const dict2filePath = dict2fileRaw ? path.resolve(cfg.workspaceRoot, dict2fileRaw) : undefined;
+    if (dict2filePath) {
+      if (path.relative(cfg.workspaceRoot, dict2filePath).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", "build_options.llvm_dict2file_path must be within workspace root");
+      }
+      env.AFL_LLVM_DICT2FILE = dict2filePath;
+      if (dict2fileNoMain) env.AFL_LLVM_DICT2FILE_NO_MAIN = "1";
+    } else if (dict2fileNoMain) {
+      throw new ToolError("INVALID_ARGUMENT", "build_options.llvm_dict2file_no_main requires build_options.llvm_dict2file_path");
+    }
 
     const run = await runCommand(buildCmd, {
       cwd: projectPath,
@@ -451,6 +699,19 @@ registerTool({
         CC: env.CC,
         CXX: env.CXX,
         AFL_LLVM_CMPLOG: env.AFL_LLVM_CMPLOG,
+        AFL_USE_ASAN: env.AFL_USE_ASAN,
+        AFL_USE_MSAN: env.AFL_USE_MSAN,
+        AFL_USE_UBSAN: env.AFL_USE_UBSAN,
+        AFL_USE_TSAN: env.AFL_USE_TSAN,
+        AFL_USE_LSAN: env.AFL_USE_LSAN,
+        AFL_USE_CFISAN: env.AFL_USE_CFISAN,
+        AFL_LLVM_LAF_ALL: env.AFL_LLVM_LAF_ALL,
+        AFL_LLVM_ONLY_FSRV: env.AFL_LLVM_ONLY_FSRV,
+        AFL_LLVM_ALLOWLIST: env.AFL_LLVM_ALLOWLIST,
+        AFL_LLVM_DENYLIST: env.AFL_LLVM_DENYLIST,
+        AFL_LLVM_INSTRUMENT: env.AFL_LLVM_INSTRUMENT,
+        AFL_LLVM_DICT2FILE: env.AFL_LLVM_DICT2FILE,
+        AFL_LLVM_DICT2FILE_NO_MAIN: env.AFL_LLVM_DICT2FILE_NO_MAIN,
       },
       build: run,
       build_log_path: path.relative(cfg.workspaceRoot, buildLogPath).replaceAll("\\", "/"),
@@ -781,6 +1042,258 @@ registerTool({
 });
 
 registerTool({
+  name: "aflpp.coverage_summary",
+  description: "Measure corpus coverage using afl-showmap -C on an AFL++ output directory.",
+  inputSchema: globalInputSchema(
+    {
+      workspace: { type: "string" },
+      target_cmd: { type: "array", items: { type: "string" } },
+      job_name: { type: "string" },
+      campaign_name: { type: "string" },
+      out_dir: { type: "string" },
+      target_timeout_ms: { type: "number" },
+      overall_timeout_ms: { type: "number" },
+      mem_limit_mb: { type: "number" },
+    },
+    ["workspace", "target_cmd"],
+  ),
+  handler: async (args) => {
+    const cfg = getConfig();
+    const { workspace } = await getWorkspace(requireString(args.workspace, "workspace"));
+    const targetCmd = requireStringArray(args.target_cmd, "target_cmd");
+    validateTargetCmdExecutable(cfg.workspaceRoot, targetCmd);
+
+    const jobNameRaw = requireOptionalString(args.job_name, "job_name");
+    const campaignNameRaw = requireOptionalString(args.campaign_name, "campaign_name");
+    const outDirRaw = requireOptionalString(args.out_dir, "out_dir");
+
+    const specified = [jobNameRaw, campaignNameRaw, outDirRaw].filter((v) => v !== undefined).length;
+    if (specified !== 1) {
+      throw new ToolError("INVALID_ARGUMENT", "Provide exactly one of: job_name, campaign_name, out_dir");
+    }
+
+    let outDirAbs: string;
+    if (jobNameRaw !== undefined) {
+      const jobName = validateName(jobNameRaw, "job_name");
+      outDirAbs = workspacePath(cfg.workspaceRoot, workspace, "out", jobName);
+    } else if (campaignNameRaw !== undefined) {
+      const campaignName = validateName(campaignNameRaw, "campaign_name");
+      outDirAbs = workspacePath(cfg.workspaceRoot, workspace, "out", campaignName);
+    } else {
+      outDirAbs = path.resolve(cfg.workspaceRoot, outDirRaw!);
+      if (path.relative(cfg.workspaceRoot, outDirAbs).startsWith("..")) throw new ToolError("PATH_OUTSIDE_ROOT", "out_dir must be within workspace root");
+    }
+
+    if (!(await pathExists(outDirAbs))) throw new ToolError("NOT_FOUND", "output directory not found");
+
+    const targetTimeoutMs = requireOptionalNumber(args.target_timeout_ms, "target_timeout_ms") ?? 1000;
+    const overallTimeoutMs = requireOptionalNumber(args.overall_timeout_ms, "overall_timeout_ms") ?? 120_000;
+    const memLimitMb = requireOptionalNumber(args.mem_limit_mb, "mem_limit_mb");
+
+    const reportDir = workspacePath(cfg.workspaceRoot, workspace, "reports", "coverage");
+    await ensureDir(reportDir);
+    const id = stableIdFromPath(path.relative(cfg.workspaceRoot, outDirAbs));
+    const logPath = path.join(reportDir, `${id}.log`);
+
+    const argv: string[] = [aflBin("afl-showmap"), "-C", "-i", outDirAbs, "-o", "/dev/null", "-t", String(targetTimeoutMs)];
+    if (memLimitMb !== undefined) argv.push("-m", String(memLimitMb));
+    argv.push("--", ...targetCmd);
+
+    const run = await runCommand(argv, {
+      cwd: cfg.workspaceRoot,
+      env: { ...process.env, AFL_PATH: cfg.aflppDir },
+      timeoutMs: overallTimeoutMs,
+      maxOutputBytes: cfg.maxToolOutputBytes,
+      logFilePath: logPath,
+      maxLogBytes: cfg.maxLogFileBytes,
+    });
+
+    const text = `${run.stdout}\n${run.stderr}`;
+    const mapSize = (() => {
+      const m = text.match(/Target map size:\s*([0-9]+)/);
+      return m ? Number(m[1]) : null;
+    })();
+
+    const processedFiles = (() => {
+      const m = text.match(/Processed\s+([0-9]+)\s+input files\./);
+      return m ? Number(m[1]) : null;
+    })();
+
+    const tuplesCaptured = (() => {
+      const m = text.match(/Captured\s+([0-9]+)\s+tuples\b/);
+      return m ? Number(m[1]) : null;
+    })();
+
+    const coverageLine = text.match(/A coverage of\s+([0-9]+)\s+edges were achieved out of\s+([0-9]+)\s+existing\s+\(([\d.]+)%\)\s+with\s+([0-9]+)\s+input files\./);
+    const coverage =
+      coverageLine
+        ? {
+            edges_covered: Number(coverageLine[1]),
+            edges_total: Number(coverageLine[2]),
+            percent: Number(coverageLine[3]),
+            input_files: Number(coverageLine[4]),
+          }
+        : null;
+
+    return ok("aflpp.coverage_summary", {
+      workspace,
+      out_dir: path.relative(cfg.workspaceRoot, outDirAbs).replaceAll("\\", "/"),
+      target_cmd: targetCmd,
+      argv,
+      report_log_path: path.relative(cfg.workspaceRoot, logPath).replaceAll("\\", "/"),
+      summary: {
+        map_size: mapSize,
+        processed_files: processedFiles,
+        tuples_captured: tuplesCaptured,
+        coverage,
+      },
+      run,
+    });
+  },
+});
+
+registerTool({
+  name: "aflpp.analyze_testcase",
+  description: "Run afl-analyze on a testcase to identify critical input regions.",
+  inputSchema: globalInputSchema(
+    {
+      workspace: { type: "string" },
+      target_cmd: { type: "array", items: { type: "string" } },
+      testcase_path: { type: "string" },
+      timeout_ms: { type: "number" },
+      overall_timeout_ms: { type: "number" },
+      mem_limit_mb: { type: "number" },
+      input_file_path: { type: "string" },
+    },
+    ["workspace", "target_cmd", "testcase_path"],
+  ),
+  handler: async (args) => {
+    const cfg = getConfig();
+    const { workspace } = await getWorkspace(requireString(args.workspace, "workspace"));
+    const targetCmd = requireStringArray(args.target_cmd, "target_cmd");
+    validateTargetCmdExecutable(cfg.workspaceRoot, targetCmd);
+    const testcaseRaw = requireString(args.testcase_path, "testcase_path");
+    const testcaseAbs = path.resolve(cfg.workspaceRoot, testcaseRaw);
+    if (path.relative(cfg.workspaceRoot, testcaseAbs).startsWith("..")) throw new ToolError("PATH_OUTSIDE_ROOT", "testcase_path must be within workspace root");
+    if (!(await pathExists(testcaseAbs))) throw new ToolError("NOT_FOUND", "testcase_path not found");
+
+    const execTimeoutMs = requireOptionalNumber(args.timeout_ms, "timeout_ms") ?? 1000;
+    if (!Number.isFinite(execTimeoutMs) || !Number.isInteger(execTimeoutMs) || execTimeoutMs < 10) {
+      throw new ToolError("INVALID_ARGUMENT", "timeout_ms must be an integer >= 10");
+    }
+    const overallTimeoutMs = requireOptionalNumber(args.overall_timeout_ms, "overall_timeout_ms") ?? Math.max(cfg.defaultTimeoutMs, 60_000);
+    const memLimitMb = requireOptionalNumber(args.mem_limit_mb, "mem_limit_mb");
+
+    const inputFileRaw = requireOptionalString(args.input_file_path, "input_file_path");
+    const inputFileAbs = inputFileRaw ? path.resolve(cfg.workspaceRoot, inputFileRaw) : undefined;
+    if (inputFileAbs && path.relative(cfg.workspaceRoot, inputFileAbs).startsWith("..")) {
+      throw new ToolError("PATH_OUTSIDE_ROOT", "input_file_path must be within workspace root");
+    }
+    if (inputFileAbs) await ensureDir(path.dirname(inputFileAbs));
+
+    const reportDir = workspacePath(cfg.workspaceRoot, workspace, "reports", "analyze");
+    await ensureDir(reportDir);
+    const id = stableIdFromPath(path.relative(cfg.workspaceRoot, testcaseAbs));
+    const logPath = path.join(reportDir, `${id}.log`);
+
+    const argv: string[] = [aflBin("afl-analyze"), "-i", testcaseAbs, "-t", String(execTimeoutMs)];
+    if (memLimitMb !== undefined) argv.push("-m", String(memLimitMb));
+    if (inputFileAbs) argv.push("-f", inputFileAbs);
+    argv.push("--", ...targetCmd);
+
+    const run = await runCommand(argv, {
+      cwd: cfg.workspaceRoot,
+      env: { ...process.env, AFL_PATH: cfg.aflppDir },
+      timeoutMs: overallTimeoutMs,
+      maxOutputBytes: cfg.maxToolOutputBytes,
+      logFilePath: logPath,
+      maxLogBytes: cfg.maxLogFileBytes,
+    });
+
+    return ok("aflpp.analyze_testcase", {
+      workspace,
+      testcase_path: path.relative(cfg.workspaceRoot, testcaseAbs).replaceAll("\\", "/"),
+      target_cmd: targetCmd,
+      argv,
+      report_log_path: path.relative(cfg.workspaceRoot, logPath).replaceAll("\\", "/"),
+      run,
+    });
+  },
+});
+
+registerTool({
+  name: "aflpp.whatsup",
+  description: "Run afl-whatsup on an AFL++ output directory.",
+  inputSchema: globalInputSchema(
+    {
+      workspace: { type: "string" },
+      job_name: { type: "string" },
+      campaign_name: { type: "string" },
+      out_dir: { type: "string" },
+      summary_only: { type: "boolean" },
+      timeout_ms: { type: "number" },
+    },
+    ["workspace"],
+  ),
+  handler: async (args) => {
+    const cfg = getConfig();
+    const { workspace } = await getWorkspace(requireString(args.workspace, "workspace"));
+
+    const jobNameRaw = requireOptionalString(args.job_name, "job_name");
+    const campaignNameRaw = requireOptionalString(args.campaign_name, "campaign_name");
+    const outDirRaw = requireOptionalString(args.out_dir, "out_dir");
+
+    const specified = [jobNameRaw, campaignNameRaw, outDirRaw].filter((v) => v !== undefined).length;
+    if (specified !== 1) {
+      throw new ToolError("INVALID_ARGUMENT", "Provide exactly one of: job_name, campaign_name, out_dir");
+    }
+
+    let outDirAbs: string;
+    if (jobNameRaw !== undefined) {
+      const jobName = validateName(jobNameRaw, "job_name");
+      outDirAbs = workspacePath(cfg.workspaceRoot, workspace, "out", jobName);
+    } else if (campaignNameRaw !== undefined) {
+      const campaignName = validateName(campaignNameRaw, "campaign_name");
+      outDirAbs = workspacePath(cfg.workspaceRoot, workspace, "out", campaignName);
+    } else {
+      outDirAbs = path.resolve(cfg.workspaceRoot, outDirRaw!);
+      if (path.relative(cfg.workspaceRoot, outDirAbs).startsWith("..")) throw new ToolError("PATH_OUTSIDE_ROOT", "out_dir must be within workspace root");
+    }
+
+    if (!(await pathExists(outDirAbs))) throw new ToolError("NOT_FOUND", "output directory not found");
+
+    const summaryOnly = requireOptionalBoolean(args.summary_only, "summary_only") ?? false;
+    const timeoutMs = requireOptionalNumber(args.timeout_ms, "timeout_ms") ?? cfg.defaultTimeoutMs;
+
+    const argv: string[] = [aflBin("afl-whatsup")];
+    if (summaryOnly) argv.push("-s");
+    argv.push(outDirAbs);
+
+    const reportDir = workspacePath(cfg.workspaceRoot, workspace, "reports", "whatsup");
+    await ensureDir(reportDir);
+    const id = stableIdFromPath(path.relative(cfg.workspaceRoot, outDirAbs));
+    const logPath = path.join(reportDir, `${id}.log`);
+
+    const run = await runCommand(argv, {
+      cwd: cfg.workspaceRoot,
+      env: { ...process.env, AFL_PATH: cfg.aflppDir },
+      timeoutMs,
+      maxOutputBytes: cfg.maxToolOutputBytes,
+      logFilePath: logPath,
+      maxLogBytes: cfg.maxLogFileBytes,
+    });
+
+    return ok("aflpp.whatsup", {
+      workspace,
+      out_dir: path.relative(cfg.workspaceRoot, outDirAbs).replaceAll("\\", "/"),
+      argv,
+      report_log_path: path.relative(cfg.workspaceRoot, logPath).replaceAll("\\", "/"),
+      run,
+    });
+  },
+});
+
+registerTool({
   name: "aflpp.preflight_checks",
   description: "Run lightweight preflight checks before starting afl-fuzz (core_pattern, CPU scaling, corpus non-empty).",
   inputSchema: globalInputSchema(
@@ -879,8 +1392,38 @@ registerTool({
       seed: { type: "number" },
       dictionary_paths: { type: "array", items: { type: "string" } },
       cmplog_path: { type: "string" },
+      cmplog_level: { type: "string" },
       resume: { type: "boolean" },
       fuzz_seconds: { type: "number" },
+      power_schedule: { type: "string" },
+      mode_preset: { type: "string", enum: ["explore", "exploit"] },
+      mopt_level: { type: "number" },
+      ascii_mode: { type: "string", enum: ["ascii", "binary"] },
+      old_queue_cycle: { type: "boolean" },
+      deterministic_only: { type: "boolean" },
+      input_file_path: { type: "string" },
+      crash_exploration: { type: "boolean" },
+      sanitizer_paths: { type: "array", items: { type: "string" } },
+      env: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          AFL_TESTCACHE_SIZE: { type: ["number", "string"] },
+          AFL_TMPDIR: { type: "string" },
+          AFL_IMPORT_FIRST: { type: ["boolean", "string", "number"] },
+          AFL_IGNORE_SEED_PROBLEMS: { type: ["boolean", "string", "number"] },
+          AFL_FAST_CAL: { type: ["boolean", "string", "number"] },
+          AFL_CMPLOG_ONLY_NEW: { type: ["boolean", "string", "number"] },
+          AFL_NO_STARTUP_CALIBRATION: { type: ["boolean", "string", "number"] },
+          AFL_DISABLE_TRIM: { type: ["boolean", "string", "number"] },
+          AFL_KEEP_TIMEOUTS: { type: ["boolean", "string", "number"] },
+          AFL_EXPAND_HAVOC_NOW: { type: ["boolean", "string", "number"] },
+          AFL_NO_AFFINITY: { type: ["boolean", "string", "number"] },
+          AFL_TRY_AFFINITY: { type: ["boolean", "string", "number"] },
+          AFL_FINAL_SYNC: { type: ["boolean", "string", "number"] },
+          AFL_AUTORESUME: { type: ["boolean", "string", "number"] },
+        },
+      },
     },
     ["workspace", "job_name", "target_cmd", "corpus_name"],
   ),
@@ -921,6 +1464,55 @@ registerTool({
       throw new ToolError("PATH_OUTSIDE_ROOT", "cmplog_path must be within workspace root");
     }
 
+    const cmplogLevel = requireOptionalString(args.cmplog_level, "cmplog_level");
+    if (cmplogLevel !== undefined) {
+      if (!/^[0-9][0-9A-Za-z]{0,15}$/.test(cmplogLevel)) {
+        throw new ToolError("INVALID_ARGUMENT", "cmplog_level must match /^[0-9][0-9A-Za-z]{0,15}$/ (e.g. '2', '2AT')");
+      }
+    }
+
+    const powerSchedule = requireOptionalString(args.power_schedule, "power_schedule");
+    if (powerSchedule !== undefined) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/.test(powerSchedule) || powerSchedule === "." || powerSchedule === "..") {
+        throw new ToolError("INVALID_ARGUMENT", "power_schedule must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/");
+      }
+    }
+    const modePreset = requireOptionalString(args.mode_preset, "mode_preset");
+
+    const moptLevel = requireOptionalNumber(args.mopt_level, "mopt_level");
+    if (moptLevel !== undefined) {
+      if (!Number.isFinite(moptLevel) || !Number.isInteger(moptLevel) || moptLevel < 0) {
+        throw new ToolError("INVALID_ARGUMENT", "mopt_level must be an integer >= 0");
+      }
+    }
+
+    const asciiMode = requireOptionalString(args.ascii_mode, "ascii_mode");
+    if (asciiMode !== undefined && asciiMode !== "ascii" && asciiMode !== "binary") {
+      throw new ToolError("INVALID_ARGUMENT", "ascii_mode must be 'ascii' or 'binary'");
+    }
+
+    const oldQueueCycle = requireOptionalBoolean(args.old_queue_cycle, "old_queue_cycle") ?? false;
+    const deterministicOnly = requireOptionalBoolean(args.deterministic_only, "deterministic_only") ?? false;
+
+    const inputFileRaw = requireOptionalString(args.input_file_path, "input_file_path");
+    const inputFileAbs = inputFileRaw ? path.resolve(cfg.workspaceRoot, inputFileRaw) : undefined;
+    if (inputFileAbs && path.relative(cfg.workspaceRoot, inputFileAbs).startsWith("..")) {
+      throw new ToolError("PATH_OUTSIDE_ROOT", "input_file_path must be within workspace root");
+    }
+    if (inputFileAbs) await ensureDir(path.dirname(inputFileAbs));
+
+    const crashExploration = requireOptionalBoolean(args.crash_exploration, "crash_exploration") ?? false;
+
+    const sanitizerPathsRaw = args.sanitizer_paths ? requireStringArray(args.sanitizer_paths, "sanitizer_paths") : [];
+    const sanitizerPathsAbs = sanitizerPathsRaw.map((p) => path.resolve(cfg.workspaceRoot, p));
+    for (const [idx, abs] of sanitizerPathsAbs.entries()) {
+      if (path.relative(cfg.workspaceRoot, abs).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", `sanitizer_paths[${idx}] must be within workspace root`);
+      }
+    }
+
+    const envOverridesRaw = args.env ? requireObject(args.env, "env") : {};
+
     const configPath = workspacePath(cfg.workspaceRoot, workspace, "reports", "job_configs", `${jobName}.json`);
     const jobConfig = (await readJsonFileIfExists(configPath)) ?? {};
     const configDicts = Array.isArray(jobConfig.dictionary_paths) ? (jobConfig.dictionary_paths as unknown[]) : [];
@@ -937,12 +1529,22 @@ registerTool({
     argv.push("-i", resume ? "-" : inputDir);
     argv.push("-o", outDir);
     argv.push("-T", jobName);
+    if (powerSchedule !== undefined) argv.push("-p", powerSchedule);
+    if (modePreset !== undefined) argv.push("-P", modePreset);
+    if (moptLevel !== undefined) argv.push("-L", String(moptLevel));
+    if (asciiMode !== undefined) argv.push("-a", asciiMode);
+    if (oldQueueCycle) argv.push("-Z");
+    if (deterministicOnly) argv.push("-D");
     if (execTimeoutMs !== undefined) argv.push("-t", String(execTimeoutMs));
     if (memLimitMb !== undefined) argv.push("-m", String(memLimitMb));
     if (seed !== undefined) argv.push("-s", String(seed));
     if (fuzzSeconds !== undefined) argv.push("-V", String(fuzzSeconds));
     for (const dp of mergedDicts) argv.push("-x", path.resolve(cfg.workspaceRoot, dp));
+    if (inputFileAbs) argv.push("-f", inputFileAbs);
     if (cmplogPathAbs) argv.push("-c", cmplogPathAbs);
+    if (cmplogLevel !== undefined) argv.push("-l", cmplogLevel);
+    if (crashExploration) argv.push("-C");
+    for (const sp of sanitizerPathsAbs) argv.push("-w", sp);
     argv.push("--", ...targetCmd);
 
     const env: NodeJS.ProcessEnv = {
@@ -952,6 +1554,7 @@ registerTool({
       AFL_SKIP_CPUFREQ: "1",
       AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1",
     };
+    const env_overrides = applyAflFuzzEnvOverrides(cfg.workspaceRoot, env, envOverridesRaw, "env");
 
     const jobLogPath = workspacePath(cfg.workspaceRoot, workspace, "reports", "jobs", `${jobName}.log`);
     await ensureDir(path.dirname(jobLogPath));
@@ -971,13 +1574,27 @@ registerTool({
         AFL_NO_UI: env.AFL_NO_UI,
         AFL_SKIP_CPUFREQ: env.AFL_SKIP_CPUFREQ,
         AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: env.AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES,
+        ...env_overrides,
       },
       out_dir: path.relative(cfg.workspaceRoot, outDir).replaceAll("\\", "/"),
       input_dir: path.relative(cfg.workspaceRoot, inputDir).replaceAll("\\", "/"),
       job_log_path: path.relative(cfg.workspaceRoot, jobLogPath).replaceAll("\\", "/"),
       dictionaries: mergedDicts,
       cmplog_path: cmplogPathRaw ?? null,
+      cmplog_level: cmplogLevel ?? null,
       fuzz_seconds: fuzzSeconds ?? null,
+      fuzz_options: {
+        power_schedule: powerSchedule ?? null,
+        mode_preset: modePreset ?? null,
+        mopt_level: moptLevel ?? null,
+        ascii_mode: asciiMode ?? null,
+        old_queue_cycle: oldQueueCycle,
+        deterministic_only: deterministicOnly,
+        input_file_path: inputFileRaw ?? null,
+        crash_exploration: crashExploration,
+        sanitizer_paths: sanitizerPathsRaw,
+        env_overrides,
+      },
     });
 
     return ok("aflpp.start_fuzz", {
@@ -991,7 +1608,20 @@ registerTool({
       job_log_path: path.relative(cfg.workspaceRoot, jobLogPath).replaceAll("\\", "/"),
       dictionaries: mergedDicts,
       cmplog_path: cmplogPathRaw ?? null,
+      cmplog_level: cmplogLevel ?? null,
       fuzz_seconds: fuzzSeconds ?? null,
+      fuzz_options: {
+        power_schedule: powerSchedule ?? null,
+        mode_preset: modePreset ?? null,
+        mopt_level: moptLevel ?? null,
+        ascii_mode: asciiMode ?? null,
+        old_queue_cycle: oldQueueCycle,
+        deterministic_only: deterministicOnly,
+        input_file_path: inputFileRaw ?? null,
+        crash_exploration: crashExploration,
+        sanitizer_paths: sanitizerPathsRaw,
+        env_overrides,
+      },
       job_meta_path: path.relative(cfg.workspaceRoot, metaPath).replaceAll("\\", "/"),
     });
   },
@@ -1000,6 +1630,625 @@ registerTool({
 registerTool({
   name: "aflpp.start_fuzz_cluster",
   description: "Start a multi-instance afl-fuzz campaign (master + secondary instances).",
+  inputSchema: globalInputSchema(
+    {
+      workspace: { type: "string" },
+      campaign_name: { type: "string" },
+      instances: { type: "number" },
+      target_cmd: { type: "array", items: { type: "string" } },
+      corpus_name: { type: "string" },
+      master_instance_name: { type: "string" },
+      secondary_instance_prefix: { type: "string" },
+      options: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          timeout_ms: { type: "number" },
+          mem_limit_mb: { type: "number" },
+          seed: { type: "number" },
+          dictionary_paths: { type: "array", items: { type: "string" } },
+          cmplog_path: { type: "string" },
+          cmplog_level: { type: "string" },
+          foreign_sync_dirs: { type: "array", items: { type: "string" } },
+          resume: { type: "boolean" },
+          fuzz_seconds: { type: "number" },
+          power_schedule: { type: "string" },
+          mode_preset: { type: "string", enum: ["explore", "exploit"] },
+          mopt_level: { type: "number" },
+          ascii_mode: { type: "string", enum: ["ascii", "binary"] },
+          old_queue_cycle: { type: "boolean" },
+          deterministic_only: { type: "boolean" },
+          input_file_path: { type: "string" },
+          crash_exploration: { type: "boolean" },
+          sanitizer_paths: { type: "array", items: { type: "string" } },
+          env: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              AFL_TESTCACHE_SIZE: { type: ["number", "string"] },
+              AFL_TMPDIR: { type: "string" },
+              AFL_IMPORT_FIRST: { type: ["boolean", "string", "number"] },
+              AFL_IGNORE_SEED_PROBLEMS: { type: ["boolean", "string", "number"] },
+              AFL_FAST_CAL: { type: ["boolean", "string", "number"] },
+              AFL_CMPLOG_ONLY_NEW: { type: ["boolean", "string", "number"] },
+              AFL_NO_STARTUP_CALIBRATION: { type: ["boolean", "string", "number"] },
+              AFL_DISABLE_TRIM: { type: ["boolean", "string", "number"] },
+              AFL_KEEP_TIMEOUTS: { type: ["boolean", "string", "number"] },
+              AFL_EXPAND_HAVOC_NOW: { type: ["boolean", "string", "number"] },
+              AFL_NO_AFFINITY: { type: ["boolean", "string", "number"] },
+              AFL_TRY_AFFINITY: { type: ["boolean", "string", "number"] },
+              AFL_FINAL_SYNC: { type: ["boolean", "string", "number"] },
+              AFL_AUTORESUME: { type: ["boolean", "string", "number"] },
+            },
+          },
+        },
+      },
+      instance_overrides: {
+        type: "object",
+        additionalProperties: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            target_cmd: { type: "array", items: { type: "string" } },
+            timeout_ms: { type: "number" },
+            mem_limit_mb: { type: "number" },
+            seed: { type: "number" },
+            dictionary_paths: { type: "array", items: { type: "string" } },
+            cmplog_path: { type: "string" },
+            cmplog_level: { type: "string" },
+            fuzz_seconds: { type: "number" },
+            power_schedule: { type: "string" },
+            mode_preset: { type: "string", enum: ["explore", "exploit"] },
+            mopt_level: { type: "number" },
+            ascii_mode: { type: "string", enum: ["ascii", "binary"] },
+            old_queue_cycle: { type: "boolean" },
+            deterministic_only: { type: "boolean" },
+            input_file_path: { type: "string" },
+            crash_exploration: { type: "boolean" },
+            sanitizer_paths: { type: "array", items: { type: "string" } },
+            env: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                AFL_TESTCACHE_SIZE: { type: ["number", "string"] },
+                AFL_TMPDIR: { type: "string" },
+                AFL_IMPORT_FIRST: { type: ["boolean", "string", "number"] },
+                AFL_IGNORE_SEED_PROBLEMS: { type: ["boolean", "string", "number"] },
+                AFL_FAST_CAL: { type: ["boolean", "string", "number"] },
+                AFL_CMPLOG_ONLY_NEW: { type: ["boolean", "string", "number"] },
+                AFL_NO_STARTUP_CALIBRATION: { type: ["boolean", "string", "number"] },
+                AFL_DISABLE_TRIM: { type: ["boolean", "string", "number"] },
+                AFL_KEEP_TIMEOUTS: { type: ["boolean", "string", "number"] },
+                AFL_EXPAND_HAVOC_NOW: { type: ["boolean", "string", "number"] },
+                AFL_NO_AFFINITY: { type: ["boolean", "string", "number"] },
+                AFL_TRY_AFFINITY: { type: ["boolean", "string", "number"] },
+                AFL_FINAL_SYNC: { type: ["boolean", "string", "number"] },
+                AFL_AUTORESUME: { type: ["boolean", "string", "number"] },
+              },
+            },
+          },
+        },
+      },
+    },
+    ["workspace", "campaign_name", "instances", "target_cmd", "corpus_name"],
+  ),
+  handler: async (args) => {
+    const cfg = getConfig();
+    const { workspace } = await getWorkspace(requireString(args.workspace, "workspace"));
+    const campaignName = validateName(requireString(args.campaign_name, "campaign_name"), "campaign_name");
+
+    if (typeof args.instances !== "number" || Number.isNaN(args.instances)) {
+      throw new ToolError("INVALID_ARGUMENT", "instances must be a number");
+    }
+    if (!Number.isFinite(args.instances) || !Number.isInteger(args.instances) || args.instances <= 0) {
+      throw new ToolError("INVALID_ARGUMENT", "instances must be a positive integer");
+    }
+    if (args.instances > 32) {
+      throw new ToolError("INVALID_ARGUMENT", "instances must be <= 32");
+    }
+    const instances = args.instances;
+
+    const masterInstanceName = validateName(
+      requireOptionalString(args.master_instance_name, "master_instance_name") ?? "master",
+      "master_instance_name",
+    );
+    const secondaryPrefix = requireOptionalString(args.secondary_instance_prefix, "secondary_instance_prefix") ?? "slave";
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,20}$/.test(secondaryPrefix) || secondaryPrefix === "." || secondaryPrefix === "..") {
+      throw new ToolError("INVALID_ARGUMENT", "secondary_instance_prefix must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,20}$/");
+    }
+
+    const targetCmd = requireStringArray(args.target_cmd, "target_cmd");
+    validateTargetCmdExecutable(cfg.workspaceRoot, targetCmd);
+    const corpusName = validateName(requireString(args.corpus_name, "corpus_name"), "corpus_name");
+    const inputDir = workspacePath(cfg.workspaceRoot, workspace, "in", corpusName);
+    if (!(await pathExists(inputDir))) throw new ToolError("NOT_FOUND", "corpus not found");
+
+    const opts = args.options ? requireObject(args.options, "options") : {};
+    const baseExecTimeoutMs = requireOptionalNumber(opts.timeout_ms, "options.timeout_ms");
+    const baseMemLimitMb = requireOptionalNumber(opts.mem_limit_mb, "options.mem_limit_mb");
+    const baseSeed = requireOptionalNumber(opts.seed, "options.seed");
+    const baseFuzzSeconds = requireOptionalNumber(opts.fuzz_seconds, "options.fuzz_seconds");
+    if (baseFuzzSeconds !== undefined) {
+      if (!Number.isFinite(baseFuzzSeconds) || !Number.isInteger(baseFuzzSeconds) || baseFuzzSeconds <= 0) {
+        throw new ToolError("INVALID_ARGUMENT", "options.fuzz_seconds must be a positive integer");
+      }
+    }
+
+    const baseDicts = opts.dictionary_paths ? requireStringArray(opts.dictionary_paths, "options.dictionary_paths") : [];
+    const baseMergedDicts = Array.from(new Set(baseDicts)).slice(-4);
+
+    const baseCmplogPathRaw = requireOptionalString(opts.cmplog_path, "options.cmplog_path");
+    const baseCmplogPathAbs = baseCmplogPathRaw ? path.resolve(cfg.workspaceRoot, baseCmplogPathRaw) : undefined;
+    if (baseCmplogPathAbs && path.relative(cfg.workspaceRoot, baseCmplogPathAbs).startsWith("..")) {
+      throw new ToolError("PATH_OUTSIDE_ROOT", "options.cmplog_path must be within workspace root");
+    }
+
+    const baseCmplogLevel = requireOptionalString(opts.cmplog_level, "options.cmplog_level");
+    if (baseCmplogLevel !== undefined) {
+      if (!/^[0-9][0-9A-Za-z]{0,15}$/.test(baseCmplogLevel)) {
+        throw new ToolError("INVALID_ARGUMENT", "options.cmplog_level must match /^[0-9][0-9A-Za-z]{0,15}$/ (e.g. '2', '2AT')");
+      }
+    }
+
+    const baseForeignSyncDirsRaw = opts.foreign_sync_dirs
+      ? requireStringArray(opts.foreign_sync_dirs, "options.foreign_sync_dirs")
+      : [];
+    if (baseForeignSyncDirsRaw.length > 32) {
+      throw new ToolError("INVALID_ARGUMENT", "options.foreign_sync_dirs must include at most 32 entries");
+    }
+    const baseForeignSyncDirsAbs = Array.from(new Set(baseForeignSyncDirsRaw)).map((d) => path.resolve(cfg.workspaceRoot, d));
+    for (const [idx, abs] of baseForeignSyncDirsAbs.entries()) {
+      if (path.relative(cfg.workspaceRoot, abs).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", `options.foreign_sync_dirs[${idx}] must be within workspace root`);
+      }
+    }
+
+    const basePowerSchedule = requireOptionalString(opts.power_schedule, "options.power_schedule");
+    if (basePowerSchedule !== undefined) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/.test(basePowerSchedule) || basePowerSchedule === "." || basePowerSchedule === "..") {
+        throw new ToolError("INVALID_ARGUMENT", "options.power_schedule must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/");
+      }
+    }
+    const baseModePreset = requireOptionalString(opts.mode_preset, "options.mode_preset");
+    if (baseModePreset !== undefined && baseModePreset !== "explore" && baseModePreset !== "exploit") {
+      throw new ToolError("INVALID_ARGUMENT", "options.mode_preset must be 'explore' or 'exploit'");
+    }
+
+    const baseMoptLevel = requireOptionalNumber(opts.mopt_level, "options.mopt_level");
+    if (baseMoptLevel !== undefined) {
+      if (!Number.isFinite(baseMoptLevel) || !Number.isInteger(baseMoptLevel) || baseMoptLevel < 0) {
+        throw new ToolError("INVALID_ARGUMENT", "options.mopt_level must be an integer >= 0");
+      }
+    }
+
+    const baseAsciiMode = requireOptionalString(opts.ascii_mode, "options.ascii_mode");
+    if (baseAsciiMode !== undefined && baseAsciiMode !== "ascii" && baseAsciiMode !== "binary") {
+      throw new ToolError("INVALID_ARGUMENT", "options.ascii_mode must be 'ascii' or 'binary'");
+    }
+
+    const baseOldQueueCycle = requireOptionalBoolean(opts.old_queue_cycle, "options.old_queue_cycle") ?? false;
+    const baseDeterministicOnly = requireOptionalBoolean(opts.deterministic_only, "options.deterministic_only") ?? false;
+
+    const baseInputFileRaw = requireOptionalString(opts.input_file_path, "options.input_file_path");
+    const baseInputFileAbs = baseInputFileRaw ? path.resolve(cfg.workspaceRoot, baseInputFileRaw) : undefined;
+    if (baseInputFileAbs && path.relative(cfg.workspaceRoot, baseInputFileAbs).startsWith("..")) {
+      throw new ToolError("PATH_OUTSIDE_ROOT", "options.input_file_path must be within workspace root");
+    }
+    if (baseInputFileAbs) await ensureDir(path.dirname(baseInputFileAbs));
+
+    const baseCrashExploration = requireOptionalBoolean(opts.crash_exploration, "options.crash_exploration") ?? false;
+
+    const baseSanitizerPathsRaw = opts.sanitizer_paths ? requireStringArray(opts.sanitizer_paths, "options.sanitizer_paths") : [];
+    const baseSanitizerPathsAbs = baseSanitizerPathsRaw.map((p) => path.resolve(cfg.workspaceRoot, p));
+    for (const [idx, abs] of baseSanitizerPathsAbs.entries()) {
+      if (path.relative(cfg.workspaceRoot, abs).startsWith("..")) {
+        throw new ToolError("PATH_OUTSIDE_ROOT", `options.sanitizer_paths[${idx}] must be within workspace root`);
+      }
+    }
+
+    const baseEnvOverridesRaw = opts.env ? requireObject(opts.env, "options.env") : {};
+
+    const resume = requireOptionalBoolean(opts.resume, "options.resume") ?? false;
+    const outDir = workspacePath(cfg.workspaceRoot, workspace, "out", campaignName);
+    if (resume) {
+      if (!(await pathExists(outDir))) throw new ToolError("NOT_FOUND", "options.resume=true but output directory does not exist");
+    } else {
+      if (await pathExists(outDir)) {
+        throw new ToolError("ALREADY_EXISTS", "output directory already exists; use options.resume=true to resume");
+      }
+    }
+
+    const campaignId = stableIdFromPath(path.join("workspaces", workspace, "out", campaignName).replaceAll("\\", "/"));
+    const metaPath = workspacePath(cfg.workspaceRoot, workspace, "reports", "campaigns", `${campaignName}.json`);
+    const filesDir = workspacePath(cfg.workspaceRoot, workspace, "reports", "campaigns", `${campaignName}.d`);
+    await ensureDir(path.dirname(metaPath));
+    await ensureDir(filesDir);
+
+    const baseEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      AFL_PATH: cfg.aflppDir,
+      AFL_NO_UI: "1",
+      AFL_SKIP_CPUFREQ: "1",
+      AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1",
+    };
+    const base_env_overrides = applyAflFuzzEnvOverrides(cfg.workspaceRoot, baseEnv, baseEnvOverridesRaw, "options.env");
+
+    const instanceNames: string[] = [masterInstanceName];
+    for (let i = 1; i < instances; i++) {
+      instanceNames.push(validateName(`${secondaryPrefix}${String(i).padStart(2, "0")}`, "instance_name"));
+    }
+    if (new Set(instanceNames).size !== instanceNames.length) {
+      throw new ToolError("INVALID_ARGUMENT", "Instance names must be unique");
+    }
+
+    const instanceOverridesRaw = args.instance_overrides ? requireObject(args.instance_overrides, "instance_overrides") : {};
+    const instanceOverrides: Record<string, Record<string, unknown>> = {};
+    for (const [k, v] of Object.entries(instanceOverridesRaw)) {
+      const inst = validateName(k, "instance_overrides key");
+      if (!instanceNames.includes(inst)) {
+        throw new ToolError("INVALID_ARGUMENT", `instance_overrides contains unknown instance '${inst}'`);
+      }
+      instanceOverrides[inst] = requireObject(v, `instance_overrides.${inst}`);
+    }
+
+    const started: Array<Record<string, unknown>> = [];
+    try {
+      for (const [idx, instName] of instanceNames.entries()) {
+        const role = idx === 0 ? "master" : "secondary";
+        const instOverride = instanceOverrides[instName] ?? {};
+        const instTargetCmdRaw = instOverride.target_cmd ? requireStringArray(instOverride.target_cmd, `instance_overrides.${instName}.target_cmd`) : targetCmd;
+        validateTargetCmdExecutable(cfg.workspaceRoot, instTargetCmdRaw);
+
+        const mergedOpts: Record<string, unknown> = { ...opts, ...instOverride };
+
+        const execTimeoutMs = requireOptionalNumber(mergedOpts.timeout_ms, `instance_overrides.${instName}.timeout_ms`);
+        const memLimitMb = requireOptionalNumber(mergedOpts.mem_limit_mb, `instance_overrides.${instName}.mem_limit_mb`);
+        const seed = requireOptionalNumber(mergedOpts.seed, `instance_overrides.${instName}.seed`);
+        const fuzzSeconds = requireOptionalNumber(mergedOpts.fuzz_seconds, `instance_overrides.${instName}.fuzz_seconds`);
+        if (fuzzSeconds !== undefined) {
+          if (!Number.isFinite(fuzzSeconds) || !Number.isInteger(fuzzSeconds) || fuzzSeconds <= 0) {
+            throw new ToolError("INVALID_ARGUMENT", `instance_overrides.${instName}.fuzz_seconds must be a positive integer`);
+          }
+        }
+
+        const powerSchedule = requireOptionalString(mergedOpts.power_schedule, `instance_overrides.${instName}.power_schedule`);
+        if (powerSchedule !== undefined) {
+          if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/.test(powerSchedule) || powerSchedule === "." || powerSchedule === "..") {
+            throw new ToolError("INVALID_ARGUMENT", `instance_overrides.${instName}.power_schedule must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/`);
+          }
+        }
+        const modePreset = requireOptionalString(mergedOpts.mode_preset, `instance_overrides.${instName}.mode_preset`);
+        if (modePreset !== undefined && modePreset !== "explore" && modePreset !== "exploit") {
+          throw new ToolError("INVALID_ARGUMENT", `instance_overrides.${instName}.mode_preset must be 'explore' or 'exploit'`);
+        }
+        const moptLevel = requireOptionalNumber(mergedOpts.mopt_level, `instance_overrides.${instName}.mopt_level`);
+        if (moptLevel !== undefined) {
+          if (!Number.isFinite(moptLevel) || !Number.isInteger(moptLevel) || moptLevel < 0) {
+            throw new ToolError("INVALID_ARGUMENT", `instance_overrides.${instName}.mopt_level must be an integer >= 0`);
+          }
+        }
+        const asciiMode = requireOptionalString(mergedOpts.ascii_mode, `instance_overrides.${instName}.ascii_mode`);
+        if (asciiMode !== undefined && asciiMode !== "ascii" && asciiMode !== "binary") {
+          throw new ToolError("INVALID_ARGUMENT", `instance_overrides.${instName}.ascii_mode must be 'ascii' or 'binary'`);
+        }
+        const oldQueueCycle = requireOptionalBoolean(mergedOpts.old_queue_cycle, `instance_overrides.${instName}.old_queue_cycle`) ?? false;
+        const deterministicOnly = requireOptionalBoolean(mergedOpts.deterministic_only, `instance_overrides.${instName}.deterministic_only`) ?? false;
+
+        const inputFileRaw = requireOptionalString(mergedOpts.input_file_path, `instance_overrides.${instName}.input_file_path`);
+        const inputFileAbs = inputFileRaw ? path.resolve(cfg.workspaceRoot, inputFileRaw) : undefined;
+        if (inputFileAbs && path.relative(cfg.workspaceRoot, inputFileAbs).startsWith("..")) {
+          throw new ToolError("PATH_OUTSIDE_ROOT", `instance_overrides.${instName}.input_file_path must be within workspace root`);
+        }
+        if (inputFileAbs) await ensureDir(path.dirname(inputFileAbs));
+
+        const crashExploration = requireOptionalBoolean(mergedOpts.crash_exploration, `instance_overrides.${instName}.crash_exploration`) ?? false;
+
+        const sanitizerPathsRaw = mergedOpts.sanitizer_paths
+          ? requireStringArray(mergedOpts.sanitizer_paths, `instance_overrides.${instName}.sanitizer_paths`)
+          : [];
+        const sanitizerPathsAbs = sanitizerPathsRaw.map((p) => path.resolve(cfg.workspaceRoot, p));
+        for (const [pidx, abs] of sanitizerPathsAbs.entries()) {
+          if (path.relative(cfg.workspaceRoot, abs).startsWith("..")) {
+            throw new ToolError("PATH_OUTSIDE_ROOT", `instance_overrides.${instName}.sanitizer_paths[${pidx}] must be within workspace root`);
+          }
+        }
+
+        const dicts = mergedOpts.dictionary_paths
+          ? requireStringArray(mergedOpts.dictionary_paths, `instance_overrides.${instName}.dictionary_paths`)
+          : [];
+        const mergedDicts = Array.from(new Set(dicts)).slice(-4);
+
+        const cmplogPathRaw = requireOptionalString(mergedOpts.cmplog_path, `instance_overrides.${instName}.cmplog_path`);
+        const cmplogPathAbs = cmplogPathRaw ? path.resolve(cfg.workspaceRoot, cmplogPathRaw) : undefined;
+        if (cmplogPathAbs && path.relative(cfg.workspaceRoot, cmplogPathAbs).startsWith("..")) {
+          throw new ToolError("PATH_OUTSIDE_ROOT", `instance_overrides.${instName}.cmplog_path must be within workspace root`);
+        }
+
+        const cmplogLevel = requireOptionalString(mergedOpts.cmplog_level, `instance_overrides.${instName}.cmplog_level`);
+        if (cmplogLevel !== undefined) {
+          if (!/^[0-9][0-9A-Za-z]{0,15}$/.test(cmplogLevel)) {
+            throw new ToolError("INVALID_ARGUMENT", `instance_overrides.${instName}.cmplog_level must match /^[0-9][0-9A-Za-z]{0,15}$/ (e.g. '2', '2AT')`);
+          }
+        }
+
+        const instEnv: NodeJS.ProcessEnv = { ...baseEnv };
+        const instEnvOverridesRaw = instOverride.env ? requireObject(instOverride.env, `instance_overrides.${instName}.env`) : {};
+        const inst_env_overrides = applyAflFuzzEnvOverrides(cfg.workspaceRoot, instEnv, instEnvOverridesRaw, `instance_overrides.${instName}.env`);
+        const env_overrides = { ...base_env_overrides, ...inst_env_overrides };
+
+        const logPath = path.join(filesDir, `${instName}.log`);
+        if (!resume) await fs.writeFile(logPath, "", "utf8");
+
+        const argv: string[] = [aflBin("afl-fuzz")];
+        argv.push("-i", resume ? "-" : inputDir);
+        argv.push("-o", outDir);
+        argv.push("-T", `${campaignName}:${instName}`);
+        if (powerSchedule !== undefined) argv.push("-p", powerSchedule);
+        if (modePreset !== undefined) argv.push("-P", modePreset);
+        if (moptLevel !== undefined) argv.push("-L", String(moptLevel));
+        if (asciiMode !== undefined) argv.push("-a", asciiMode);
+        if (oldQueueCycle) argv.push("-Z");
+        if (deterministicOnly) argv.push("-D");
+        if (execTimeoutMs !== undefined) argv.push("-t", String(execTimeoutMs));
+        if (memLimitMb !== undefined) argv.push("-m", String(memLimitMb));
+        if (seed !== undefined) argv.push("-s", String(seed));
+        if (fuzzSeconds !== undefined) argv.push("-V", String(fuzzSeconds));
+        for (const dp of mergedDicts) argv.push("-x", path.resolve(cfg.workspaceRoot, dp));
+        if (inputFileAbs) argv.push("-f", inputFileAbs);
+        if (cmplogPathAbs) argv.push("-c", cmplogPathAbs);
+        if (cmplogLevel !== undefined) argv.push("-l", cmplogLevel);
+        if (crashExploration) argv.push("-C");
+        for (const sp of sanitizerPathsAbs) argv.push("-w", sp);
+        if (idx === 0) {
+          argv.push("-M", instName);
+          for (const dir of baseForeignSyncDirsAbs) argv.push("-F", dir);
+        } else {
+          argv.push("-S", instName);
+        }
+        argv.push("--", ...instTargetCmdRaw);
+
+        const spawnRes = spawnDetached(argv, {
+          cwd: cfg.workspaceRoot,
+          env: instEnv,
+          logFilePath: logPath,
+          maxLogBytes: cfg.maxLogFileBytes,
+        });
+
+        started.push({
+          instance_name: instName,
+          role,
+          pid: spawnRes.pid,
+          argv,
+          instance_dir: path.relative(cfg.workspaceRoot, path.join(outDir, instName)).replaceAll("\\", "/"),
+          log_path: path.relative(cfg.workspaceRoot, logPath).replaceAll("\\", "/"),
+          env_overrides,
+        });
+      }
+    } catch (e) {
+      // Best-effort cleanup: stop any instances we already started.
+      for (const inst of started) {
+        const pid = typeof inst.pid === "number" ? (inst.pid as number) : null;
+        if (!pid) continue;
+        try {
+          process.kill(-pid, "SIGTERM");
+        } catch {
+          try {
+            process.kill(pid, "SIGTERM");
+          } catch {
+            // ignore
+          }
+        }
+      }
+      throw e;
+    }
+
+    await writeJsonFile(metaPath, {
+      campaign_id: campaignId,
+      campaign_name: campaignName,
+      workspace,
+      created_at: nowIso(),
+      instances_requested: instances,
+      master_instance_name: masterInstanceName,
+      secondary_instance_prefix: secondaryPrefix,
+      out_dir: path.relative(cfg.workspaceRoot, outDir).replaceAll("\\", "/"),
+      input_dir: path.relative(cfg.workspaceRoot, inputDir).replaceAll("\\", "/"),
+      corpus_name: corpusName,
+      target_cmd: targetCmd,
+      options: {
+        timeout_ms: baseExecTimeoutMs ?? null,
+        mem_limit_mb: baseMemLimitMb ?? null,
+        seed: baseSeed ?? null,
+        fuzz_seconds: baseFuzzSeconds ?? null,
+        dictionary_paths: baseMergedDicts,
+        cmplog_path: baseCmplogPathRaw ?? null,
+        cmplog_level: baseCmplogLevel ?? null,
+        foreign_sync_dirs: baseForeignSyncDirsRaw,
+        power_schedule: basePowerSchedule ?? null,
+        mode_preset: baseModePreset ?? null,
+        mopt_level: baseMoptLevel ?? null,
+        ascii_mode: baseAsciiMode ?? null,
+        old_queue_cycle: baseOldQueueCycle,
+        deterministic_only: baseDeterministicOnly,
+        input_file_path: baseInputFileRaw ?? null,
+        crash_exploration: baseCrashExploration,
+        sanitizer_paths: baseSanitizerPathsRaw,
+        resume,
+      },
+      env: {
+        AFL_PATH: baseEnv.AFL_PATH,
+        AFL_NO_UI: baseEnv.AFL_NO_UI,
+        AFL_SKIP_CPUFREQ: baseEnv.AFL_SKIP_CPUFREQ,
+        AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: baseEnv.AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES,
+        ...base_env_overrides,
+      },
+      instance_overrides: instanceOverrides,
+      instances: started,
+      meta_path: path.relative(cfg.workspaceRoot, metaPath).replaceAll("\\", "/"),
+      files_dir: path.relative(cfg.workspaceRoot, filesDir).replaceAll("\\", "/"),
+    });
+
+    return ok("aflpp.start_fuzz_cluster", {
+      workspace,
+      campaign_id: campaignId,
+      campaign_name: campaignName,
+      out_dir: path.relative(cfg.workspaceRoot, outDir).replaceAll("\\", "/"),
+      instances: started,
+      campaign_meta_path: path.relative(cfg.workspaceRoot, metaPath).replaceAll("\\", "/"),
+      campaign_files_dir: path.relative(cfg.workspaceRoot, filesDir).replaceAll("\\", "/"),
+    });
+  },
+});
+
+registerTool({
+  name: "aflpp.suggest_fuzz_cluster_mix",
+  description: "Suggest a multi-core campaign mix (instance_overrides) for aflpp.start_fuzz_cluster.",
+  inputSchema: globalInputSchema(
+    {
+      instances: { type: "number" },
+      master_instance_name: { type: "string" },
+      secondary_instance_prefix: { type: "string" },
+    },
+    ["instances"],
+  ),
+  handler: async (args) => {
+    if (typeof args.instances !== "number" || Number.isNaN(args.instances)) {
+      throw new ToolError("INVALID_ARGUMENT", "instances must be a number");
+    }
+    if (!Number.isFinite(args.instances) || !Number.isInteger(args.instances) || args.instances <= 0) {
+      throw new ToolError("INVALID_ARGUMENT", "instances must be a positive integer");
+    }
+    if (args.instances > 32) {
+      throw new ToolError("INVALID_ARGUMENT", "instances must be <= 32");
+    }
+    const instances = args.instances;
+
+    const masterInstanceName = validateName(
+      requireOptionalString(args.master_instance_name, "master_instance_name") ?? "master",
+      "master_instance_name",
+    );
+    const secondaryPrefix = requireOptionalString(args.secondary_instance_prefix, "secondary_instance_prefix") ?? "slave";
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,20}$/.test(secondaryPrefix) || secondaryPrefix === "." || secondaryPrefix === "..") {
+      throw new ToolError("INVALID_ARGUMENT", "secondary_instance_prefix must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,20}$/");
+    }
+
+    const schedules = ["explore", "fast", "coe", "lin", "quad", "exploit", "rare"];
+
+    const instanceNames: string[] = [masterInstanceName];
+    for (let i = 1; i < instances; i++) {
+      instanceNames.push(validateName(`${secondaryPrefix}${String(i).padStart(2, "0")}`, "instance_name"));
+    }
+
+    const instance_overrides: Record<string, Record<string, unknown>> = {};
+
+    // Master: keep mostly default, but enable final sync.
+    instance_overrides[masterInstanceName] = { env: { AFL_FINAL_SYNC: true } };
+
+    // Secondaries: deterministic mix based on index buckets (roughly matching upstream recommendations).
+    for (let i = 1; i < instanceNames.length; i++) {
+      const name = instanceNames[i]!;
+      const bucket = (i - 1) % 10;
+
+      const env: Record<string, unknown> = {};
+      if (bucket <= 5) env.AFL_DISABLE_TRIM = true; // ~60%
+      if (bucket % 2 === 0) env.AFL_KEEP_TIMEOUTS = true; // ~50%
+
+      const override: Record<string, unknown> = {
+        power_schedule: schedules[(i - 1) % schedules.length],
+        env,
+      };
+
+      if (bucket <= 3) override.mode_preset = "explore"; // 40%
+      else if (bucket <= 5) override.mode_preset = "exploit"; // 20%
+
+      if (bucket === 0) override.mopt_level = 0; // ~10%
+      if (bucket === 1) override.old_queue_cycle = true; // ~10%
+
+      if (bucket <= 2) override.ascii_mode = "ascii"; // 30%
+      else if (bucket >= 7) override.ascii_mode = "binary"; // 30%
+
+      instance_overrides[name] = override;
+    }
+
+    return ok("aflpp.suggest_fuzz_cluster_mix", {
+      instances,
+      master_instance_name: masterInstanceName,
+      secondary_instance_prefix: secondaryPrefix,
+      instance_names: instanceNames,
+      instance_overrides,
+      notes: [
+        "Apply by passing instance_overrides into aflpp.start_fuzz_cluster.",
+        "To add sanitizer or laf-intel variants, override target_cmd per instance to point at the corresponding built binaries.",
+        "To enable CMPLOG/redqueen, set cmplog_path (and optionally cmplog_level) for selected instances.",
+        "To use SAND, set sanitizer_paths (afl-fuzz -w) for selected instances.",
+      ],
+    });
+  },
+});
+
+registerTool({
+  name: "aflpp.distributed_sync_plan",
+  description: "Generate an rsync mesh script for syncing distributed AFL++ campaigns across multiple hosts.",
+  inputSchema: globalInputSchema(
+    {
+      servers: { type: "array", items: { type: "string" } },
+      remote_out_dir: { type: "string" },
+      master_instance_prefix: { type: "string" },
+      ssh_user: { type: "string" },
+    },
+    ["servers", "remote_out_dir"],
+  ),
+  handler: async (args) => {
+    const servers = requireStringArray(args.servers, "servers");
+    if (servers.length < 2) throw new ToolError("INVALID_ARGUMENT", "servers must include at least 2 entries");
+    for (const [idx, s] of servers.entries()) {
+      if (!/^[A-Za-z0-9_.-]+$/.test(s)) {
+        throw new ToolError("INVALID_ARGUMENT", `servers[${idx}] must match /^[A-Za-z0-9_.-]+$/`);
+      }
+    }
+    const remoteOutDir = requireString(args.remote_out_dir, "remote_out_dir");
+    const masterPrefix = requireOptionalString(args.master_instance_prefix, "master_instance_prefix") ?? "main-";
+    if (masterPrefix.length === 0) throw new ToolError("INVALID_ARGUMENT", "master_instance_prefix must be non-empty");
+    const sshUser = requireOptionalString(args.ssh_user, "ssh_user");
+
+    const lines: string[] = [];
+    lines.push("#!/usr/bin/env bash");
+    lines.push("set -euo pipefail");
+    lines.push("");
+    lines.push(`SERVERS=(${servers.map((s) => `'${s}'`).join(" ")})`);
+    lines.push(`OUT_DIR='${remoteOutDir.replaceAll("'", "'\\''")}'`);
+    lines.push(`MASTER_PREFIX='${masterPrefix.replaceAll("'", "'\\''")}'`);
+    if (sshUser) lines.push(`SSH_USER='${sshUser.replaceAll("'", "'\\''")}'`);
+    lines.push("");
+    lines.push("for FROM in \"${SERVERS[@]}\"; do");
+    lines.push("  for TO in \"${SERVERS[@]}\"; do");
+    lines.push("    rsync -rlpogtz --rsh=ssh \\");
+    if (sshUser) {
+      lines.push("      \"${SSH_USER}@${FROM}:${OUT_DIR}/${MASTER_PREFIX}${FROM}\" \\");
+      lines.push("      \"${SSH_USER}@${TO}:${OUT_DIR}/\"");
+    } else {
+      lines.push("      \"${FROM}:${OUT_DIR}/${MASTER_PREFIX}${FROM}\" \\");
+      lines.push("      \"${TO}:${OUT_DIR}/\"");
+    }
+    lines.push("  done");
+    lines.push("done");
+
+    return ok("aflpp.distributed_sync_plan", {
+      servers,
+      ssh_user: sshUser ?? null,
+      remote_out_dir: remoteOutDir,
+      master_instance_prefix: masterPrefix,
+      script: lines.join("\n") + "\n",
+      notes: [
+        "Run one -M (main) instance per host with a unique name (e.g. main-$HOSTNAME) but the same -o directory path on all hosts.",
+        "This tool generates a mesh sync like the upstream fuzzing_in_depth.md example; run it periodically (cron) as needed.",
+      ],
+    });
+  },
+});
+
+registerTool({
+  name: "aflpp.start_fuzz_ci_cluster",
+  description: "Start a CI-oriented afl-fuzz campaign (secondary-only instances; enables fast calibration by default).",
   inputSchema: globalInputSchema(
     {
       workspace: { type: "string" },
@@ -1016,8 +2265,31 @@ registerTool({
           seed: { type: "number" },
           dictionary_paths: { type: "array", items: { type: "string" } },
           cmplog_path: { type: "string" },
-          resume: { type: "boolean" },
+          cmplog_level: { type: "string" },
           fuzz_seconds: { type: "number" },
+          resume: { type: "boolean" },
+          instance_prefix: { type: "string" },
+          randomize: { type: "boolean" },
+          env: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              AFL_TESTCACHE_SIZE: { type: ["number", "string"] },
+              AFL_TMPDIR: { type: "string" },
+              AFL_IMPORT_FIRST: { type: ["boolean", "string", "number"] },
+              AFL_IGNORE_SEED_PROBLEMS: { type: ["boolean", "string", "number"] },
+              AFL_FAST_CAL: { type: ["boolean", "string", "number"] },
+              AFL_CMPLOG_ONLY_NEW: { type: ["boolean", "string", "number"] },
+              AFL_NO_STARTUP_CALIBRATION: { type: ["boolean", "string", "number"] },
+              AFL_DISABLE_TRIM: { type: ["boolean", "string", "number"] },
+              AFL_KEEP_TIMEOUTS: { type: ["boolean", "string", "number"] },
+              AFL_EXPAND_HAVOC_NOW: { type: ["boolean", "string", "number"] },
+              AFL_NO_AFFINITY: { type: ["boolean", "string", "number"] },
+              AFL_TRY_AFFINITY: { type: ["boolean", "string", "number"] },
+              AFL_FINAL_SYNC: { type: ["boolean", "string", "number"] },
+              AFL_AUTORESUME: { type: ["boolean", "string", "number"] },
+            },
+          },
         },
       },
     },
@@ -1062,7 +2334,14 @@ registerTool({
     const cmplogPathRaw = requireOptionalString(opts.cmplog_path, "options.cmplog_path");
     const cmplogPathAbs = cmplogPathRaw ? path.resolve(cfg.workspaceRoot, cmplogPathRaw) : undefined;
     if (cmplogPathAbs && path.relative(cfg.workspaceRoot, cmplogPathAbs).startsWith("..")) {
-      throw new ToolError("PATH_OUTSIDE_ROOT", "cmplog_path must be within workspace root");
+      throw new ToolError("PATH_OUTSIDE_ROOT", "options.cmplog_path must be within workspace root");
+    }
+
+    const cmplogLevel = requireOptionalString(opts.cmplog_level, "options.cmplog_level");
+    if (cmplogLevel !== undefined) {
+      if (!/^[0-9][0-9A-Za-z]{0,15}$/.test(cmplogLevel)) {
+        throw new ToolError("INVALID_ARGUMENT", "options.cmplog_level must match /^[0-9][0-9A-Za-z]{0,15}$/ (e.g. '2', '2AT')");
+      }
     }
 
     const resume = requireOptionalBoolean(opts.resume, "options.resume") ?? false;
@@ -1075,63 +2354,114 @@ registerTool({
       }
     }
 
-    const campaignId = stableIdFromPath(path.join("workspaces", workspace, "out", campaignName).replaceAll("\\", "/"));
-    const metaPath = workspacePath(cfg.workspaceRoot, workspace, "reports", "campaigns", `${campaignName}.json`);
-    const filesDir = workspacePath(cfg.workspaceRoot, workspace, "reports", "campaigns", `${campaignName}.d`);
-    await ensureDir(path.dirname(metaPath));
-    await ensureDir(filesDir);
+    const instancePrefix = requireOptionalString(opts.instance_prefix, "options.instance_prefix") ?? "ci";
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,20}$/.test(instancePrefix) || instancePrefix === "." || instancePrefix === "..") {
+      throw new ToolError("INVALID_ARGUMENT", "options.instance_prefix must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,20}$/");
+    }
+    const randomize = requireOptionalBoolean(opts.randomize, "options.randomize") ?? false;
 
-    const env: NodeJS.ProcessEnv = {
+    const envOverridesRaw = opts.env ? requireObject(opts.env, "options.env") : {};
+    const ciDefaults: Record<string, unknown> = { AFL_FAST_CAL: true, AFL_CMPLOG_ONLY_NEW: true };
+    const mergedEnvOverridesRaw: Record<string, unknown> = { ...ciDefaults, ...envOverridesRaw };
+
+    const baseEnv: NodeJS.ProcessEnv = {
       ...process.env,
       AFL_PATH: cfg.aflppDir,
       AFL_NO_UI: "1",
       AFL_SKIP_CPUFREQ: "1",
       AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1",
     };
+    const base_env_overrides = applyAflFuzzEnvOverrides(cfg.workspaceRoot, baseEnv, mergedEnvOverridesRaw, "options.env");
 
-    const instanceNames: string[] = ["master"];
-    for (let i = 1; i < instances; i++) {
-      instanceNames.push(`slave${String(i).padStart(2, "0")}`);
-    }
+    const campaignId = stableIdFromPath(path.join("workspaces", workspace, "out", campaignName).replaceAll("\\", "/"));
+    const metaPath = workspacePath(cfg.workspaceRoot, workspace, "reports", "campaigns", `${campaignName}.json`);
+    const filesDir = workspacePath(cfg.workspaceRoot, workspace, "reports", "campaigns", `${campaignName}.d`);
+    await ensureDir(path.dirname(metaPath));
+    await ensureDir(filesDir);
 
+    const schedulePool = ["explore", "fast", "coe", "lin", "quad", "exploit", "rare"];
     const started: Array<Record<string, unknown>> = [];
     try {
-      for (const [idx, instName] of instanceNames.entries()) {
-        const role = idx === 0 ? "master" : "secondary";
+      for (let i = 1; i <= instances; i++) {
+        const instName = validateName(`${instancePrefix}${String(i).padStart(2, "0")}`, "instance_name");
         const logPath = path.join(filesDir, `${instName}.log`);
         if (!resume) await fs.writeFile(logPath, "", "utf8");
+
+        const instEnv: NodeJS.ProcessEnv = { ...baseEnv };
+        const instEnvOverrides: Record<string, unknown> = {};
+
+        let instPowerSchedule: string | undefined;
+        let instModePreset: string | undefined;
+        let instMoptLevel: number | undefined;
+        let instOldQueue = false;
+        let instAsciiMode: "ascii" | "binary" | undefined;
+        let instCmplogLevel: string | undefined = cmplogLevel;
+
+        if (randomize) {
+          if (!Object.prototype.hasOwnProperty.call(envOverridesRaw, "AFL_DISABLE_TRIM") && Math.random() < 0.65) instEnvOverrides.AFL_DISABLE_TRIM = true;
+          if (!Object.prototype.hasOwnProperty.call(envOverridesRaw, "AFL_KEEP_TIMEOUTS") && Math.random() < 0.5) instEnvOverrides.AFL_KEEP_TIMEOUTS = true;
+          if (!Object.prototype.hasOwnProperty.call(envOverridesRaw, "AFL_EXPAND_HAVOC_NOW") && Math.random() < 0.4)
+            instEnvOverrides.AFL_EXPAND_HAVOC_NOW = true;
+
+          instPowerSchedule = schedulePool[Math.floor(Math.random() * schedulePool.length)];
+
+          const rPreset = Math.random();
+          if (rPreset < 0.4) instModePreset = "explore";
+          else if (rPreset < 0.6) instModePreset = "exploit";
+
+          if (Math.random() < 0.1) instMoptLevel = 0;
+          if (Math.random() < 0.2) instOldQueue = true;
+
+          const rAscii = Math.random();
+          if (rAscii < 0.3) instAsciiMode = "ascii";
+          else if (rAscii < 0.6) instAsciiMode = "binary";
+
+          if (cmplogPathAbs && instCmplogLevel === undefined) {
+            const r = Math.random();
+            instCmplogLevel = r < 0.7 ? "2" : r < 0.8 ? "3" : "2AT";
+          }
+        }
+
+        const inst_env_overrides = applyAflFuzzEnvOverrides(cfg.workspaceRoot, instEnv, instEnvOverrides, `ci.${instName}.env`);
+        const effective_env_overrides = { ...base_env_overrides, ...inst_env_overrides };
 
         const argv: string[] = [aflBin("afl-fuzz")];
         argv.push("-i", resume ? "-" : inputDir);
         argv.push("-o", outDir);
         argv.push("-T", `${campaignName}:${instName}`);
+        if (instPowerSchedule) argv.push("-p", instPowerSchedule);
+        if (instModePreset) argv.push("-P", instModePreset);
+        if (instMoptLevel !== undefined) argv.push("-L", String(instMoptLevel));
+        if (instAsciiMode) argv.push("-a", instAsciiMode);
+        if (instOldQueue) argv.push("-Z");
         if (execTimeoutMs !== undefined) argv.push("-t", String(execTimeoutMs));
         if (memLimitMb !== undefined) argv.push("-m", String(memLimitMb));
         if (seed !== undefined) argv.push("-s", String(seed));
         if (fuzzSeconds !== undefined) argv.push("-V", String(fuzzSeconds));
         for (const dp of mergedDicts) argv.push("-x", path.resolve(cfg.workspaceRoot, dp));
         if (cmplogPathAbs) argv.push("-c", cmplogPathAbs);
-        argv.push(idx === 0 ? "-M" : "-S", instName);
+        if (instCmplogLevel !== undefined) argv.push("-l", instCmplogLevel);
+        argv.push("-S", instName);
         argv.push("--", ...targetCmd);
 
         const spawnRes = spawnDetached(argv, {
           cwd: cfg.workspaceRoot,
-          env,
+          env: instEnv,
           logFilePath: logPath,
           maxLogBytes: cfg.maxLogFileBytes,
         });
 
         started.push({
           instance_name: instName,
-          role,
+          role: "secondary",
           pid: spawnRes.pid,
           argv,
           instance_dir: path.relative(cfg.workspaceRoot, path.join(outDir, instName)).replaceAll("\\", "/"),
           log_path: path.relative(cfg.workspaceRoot, logPath).replaceAll("\\", "/"),
+          env_overrides: effective_env_overrides,
         });
       }
     } catch (e) {
-      // Best-effort cleanup: stop any instances we already started.
       for (const inst of started) {
         const pid = typeof inst.pid === "number" ? (inst.pid as number) : null;
         if (!pid) continue;
@@ -1153,6 +2483,7 @@ registerTool({
       campaign_name: campaignName,
       workspace,
       created_at: nowIso(),
+      mode: "ci",
       instances_requested: instances,
       out_dir: path.relative(cfg.workspaceRoot, outDir).replaceAll("\\", "/"),
       input_dir: path.relative(cfg.workspaceRoot, inputDir).replaceAll("\\", "/"),
@@ -1165,20 +2496,24 @@ registerTool({
         fuzz_seconds: fuzzSeconds ?? null,
         dictionary_paths: mergedDicts,
         cmplog_path: cmplogPathRaw ?? null,
+        cmplog_level: cmplogLevel ?? null,
+        instance_prefix: instancePrefix,
+        randomize,
         resume,
       },
       env: {
-        AFL_PATH: env.AFL_PATH,
-        AFL_NO_UI: env.AFL_NO_UI,
-        AFL_SKIP_CPUFREQ: env.AFL_SKIP_CPUFREQ,
-        AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: env.AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES,
+        AFL_PATH: baseEnv.AFL_PATH,
+        AFL_NO_UI: baseEnv.AFL_NO_UI,
+        AFL_SKIP_CPUFREQ: baseEnv.AFL_SKIP_CPUFREQ,
+        AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: baseEnv.AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES,
+        ...base_env_overrides,
       },
       instances: started,
       meta_path: path.relative(cfg.workspaceRoot, metaPath).replaceAll("\\", "/"),
       files_dir: path.relative(cfg.workspaceRoot, filesDir).replaceAll("\\", "/"),
     });
 
-    return ok("aflpp.start_fuzz_cluster", {
+    return ok("aflpp.start_fuzz_ci_cluster", {
       workspace,
       campaign_id: campaignId,
       campaign_name: campaignName,
@@ -1955,6 +3290,80 @@ registerTool({
       dedup_signature: dedupSignature,
       sanitizer_frames: frames,
       minimized_testcase: minimizedExists ? path.relative(cfg.workspaceRoot, minimizedPathAbs).replaceAll("\\", "/") : null,
+    });
+  },
+});
+
+registerTool({
+  name: "aflpp.casr_report",
+  description: "Generate clustered crash reports using casr-afl (if installed).",
+  inputSchema: globalInputSchema(
+    {
+      workspace: { type: "string" },
+      job_name: { type: "string" },
+      campaign_name: { type: "string" },
+      out_dir: { type: "string" },
+      report_name: { type: "string" },
+      timeout_ms: { type: "number" },
+    },
+    ["workspace"],
+  ),
+  handler: async (args) => {
+    const cfg = getConfig();
+    const { workspace } = await getWorkspace(requireString(args.workspace, "workspace"));
+
+    const jobNameRaw = requireOptionalString(args.job_name, "job_name");
+    const campaignNameRaw = requireOptionalString(args.campaign_name, "campaign_name");
+    const outDirRaw = requireOptionalString(args.out_dir, "out_dir");
+
+    const specified = [jobNameRaw, campaignNameRaw, outDirRaw].filter((v) => v !== undefined).length;
+    if (specified !== 1) {
+      throw new ToolError("INVALID_ARGUMENT", "Provide exactly one of: job_name, campaign_name, out_dir");
+    }
+
+    let outDirAbs: string;
+    if (jobNameRaw !== undefined) {
+      const jobName = validateName(jobNameRaw, "job_name");
+      outDirAbs = workspacePath(cfg.workspaceRoot, workspace, "out", jobName);
+    } else if (campaignNameRaw !== undefined) {
+      const campaignName = validateName(campaignNameRaw, "campaign_name");
+      outDirAbs = workspacePath(cfg.workspaceRoot, workspace, "out", campaignName);
+    } else {
+      outDirAbs = path.resolve(cfg.workspaceRoot, outDirRaw!);
+      if (path.relative(cfg.workspaceRoot, outDirAbs).startsWith("..")) throw new ToolError("PATH_OUTSIDE_ROOT", "out_dir must be within workspace root");
+    }
+
+    if (!(await pathExists(outDirAbs))) throw new ToolError("NOT_FOUND", "output directory not found");
+
+    const casrPath = await resolveExecutableInPath("casr-afl");
+    if (!casrPath) {
+      throw new ToolError("DEPENDENCY_MISSING", "casr-afl not found in PATH (install CASR to use this tool)");
+    }
+
+    const reportNameRaw = requireOptionalString(args.report_name, "report_name");
+    const reportName = reportNameRaw ? validateName(reportNameRaw, "report_name") : stableIdFromPath(path.relative(cfg.workspaceRoot, outDirAbs));
+    const reportDir = workspacePath(cfg.workspaceRoot, workspace, "reports", "casr", reportName);
+    await ensureDir(reportDir);
+    const logPath = path.join(reportDir, "casr.log");
+
+    const timeoutMs = requireOptionalNumber(args.timeout_ms, "timeout_ms") ?? 120_000;
+    const argv: string[] = [casrPath, "-i", outDirAbs, "-o", reportDir];
+    const run = await runCommand(argv, {
+      cwd: cfg.workspaceRoot,
+      env: { ...process.env },
+      timeoutMs,
+      maxOutputBytes: cfg.maxToolOutputBytes,
+      logFilePath: logPath,
+      maxLogBytes: cfg.maxLogFileBytes,
+    });
+
+    return ok("aflpp.casr_report", {
+      workspace,
+      out_dir: path.relative(cfg.workspaceRoot, outDirAbs).replaceAll("\\", "/"),
+      report_dir: path.relative(cfg.workspaceRoot, reportDir).replaceAll("\\", "/"),
+      report_log_path: path.relative(cfg.workspaceRoot, logPath).replaceAll("\\", "/"),
+      argv,
+      run,
     });
   },
 });
