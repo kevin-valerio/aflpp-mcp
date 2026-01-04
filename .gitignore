@@ -4,11 +4,4 @@ node_modules/
 dist/
 workspaces/
 
-fixtures/cpp/**
-!fixtures/cpp/CMakeLists.txt
-!fixtures/cpp/Makefile
-!fixtures/cpp/README.md
-!fixtures/cpp/src/
-!fixtures/cpp/src/**
-!fixtures/cpp/seeds/
-!fixtures/cpp/seeds/**
+fixtures/
