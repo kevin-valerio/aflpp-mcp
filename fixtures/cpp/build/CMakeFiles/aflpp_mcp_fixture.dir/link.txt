@@ -1,1 +1,0 @@
-/home/kevinv/aflpp-mcp/AFLplusplus/afl-c++ -O2 -g -DNDEBUG CMakeFiles/aflpp_mcp_fixture.dir/src/main.cpp.o -o aflpp_mcp_fixture 
